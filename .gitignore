@@ -1,0 +1,10 @@
+.venv/
+chroma_db/
+data/raw/
+data/processed/
+logs/
+__pycache__/
+.env
+.DS_Store
+*.pyc
+*.parquet
