@@ -51,8 +51,8 @@ class Preprocessor:
                 logger.error(f"Error loading {fname}: {e}")
                 continue
             
-            # Extract text from /search/ endpoint response structure
-            text = data.get('plain_text')
+            # Prefer extracted full text persisted during ingestion.
+            text = data.get('plain_text') or data.get('extracted_text')
             if not text:
                 text = self._strip_html(data.get('html'))
             # Try nested opinions structure (from /search/ endpoint)

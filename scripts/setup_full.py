@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Full setup: fetch all available documents, preprocess, and index.
+"""CLI for fetching, preprocessing, and indexing the corpus.
 
-This script intentionally removes artificial caps used in quick-setup flows
-and attempts to fetch as much as the upstream APIs allow. Use with care
-— this may be network- and time-intensive.
+Usage examples:
+  python scripts/setup_full.py --cases 1000 --granules 500 --ecfr-titles 10 --reindex
 
-Usage:
-    source .venv/bin/activate
-    python scripts/setup_full.py
+This module exposes functions that other modules (like the Streamlit data-refresh
+page) can import and call programmatically.
 """
 import os
 import sys
-import logging
+import argparse
 from datetime import datetime
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -25,43 +23,42 @@ from src.data.preprocessor import Preprocessor
 from src.rag.indexer import Indexer
 from src.config import Config
 from src.observability.logger import get_logger
+from tqdm import tqdm
 
 logger = get_logger(__name__)
 
 
-def fetch_all_courtlistener():
+def fetch_courtlistener(target_cases: int = 1000, max_pages: int = 1000, skip_existing: bool = False) -> list:
     client = CourtListenerClient()
-    # Use a very large max_pages to attempt exhaustiveness; CourtListener will stop if no next page
-    max_pages = max(1000, getattr(Config, 'COURTLISTENER_MAX_PAGES', 10))
-    print(f"Fetching CourtListener opinions (up to {max_pages} pages)...")
-    saved = client.fetch_opinions(query="", max_pages=max_pages, skip_existing=False, stop_after_seen=None)
+    max_pages = max_pages or getattr(Config, 'COURTLISTENER_MAX_PAGES', 10)
+    print(f"Fetching CourtListener opinions (up to {max_pages} pages, stopping after {target_cases} saved opinions)...")
+    saved = client.fetch_opinions(query="", max_pages=max_pages, skip_existing=skip_existing, stop_after_seen=None, stop_after_count=target_cases)
     print(f"Saved {len(saved)} opinions")
     return saved
 
 
-def fetch_all_uscode():
+def fetch_uscode(target_granules: int = 500, max_pages: int = 200) -> list:
     client = USCodeClient()
     if not client.api_key:
         print("GOVINFO_API_KEY not set — skipping U.S. Code fetch")
         return []
-    # Request date-sorted results first, increase max pages
-    print("Fetching U.S. Code granules (many pages)...")
-    saved = client.fetch_sections(max_pages=1000, sort_by="DATE")
+    print(f"Fetching U.S. Code granules (up to {max_pages} pages, stopping after {target_granules} granules)...")
+    saved = client.fetch_sections(max_pages=max_pages, sort_by="DATE", stop_after_count=target_granules)
     print(f"Processed {len(saved)} USC granules")
     return saved
 
 
-def fetch_all_ecfr():
+def fetch_ecfr(titles_to_check: int = 10) -> int:
     client = ECFRClient()
     titles = client.list_titles()
-    # fetch all non-reserved titles, newest first
+    # sort newest first
     titles_sorted = sorted(
         titles,
         key=lambda t: t.get('latest_issue_date') or t.get('up_to_date_as_of') or "",
         reverse=True,
     )
     saved = 0
-    for t in titles_sorted:
+    for t in tqdm(titles_sorted[:max(1, int(titles_to_check))], desc="eCFR Titles", unit="title"):
         if t.get('reserved'):
             continue
         tn = t.get('number')
@@ -99,20 +96,33 @@ def preprocess_and_index():
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Fetch, preprocess and index legal corpora')
+    parser.add_argument('--cases', type=int, default=1000, help='Number of court opinions to fetch')
+    parser.add_argument('--case-pages', type=int, default=1000, help='Max pages for CourtListener fetch')
+    parser.add_argument('--granules', type=int, default=500, help='Number of US Code granules to fetch')
+    parser.add_argument('--granule-pages', type=int, default=200, help='Max pages for US Code fetch')
+    parser.add_argument('--ecfr-titles', type=int, default=10, help='Number of eCFR titles to fetch (newest first)')
+    parser.add_argument('--no-reindex', dest='reindex', action='store_false', help='Skip preprocessing and reindex step')
+    parser.add_argument('--embed-model', type=str, default=None, help='Override embed model with env var EMBED_MODEL')
+    args = parser.parse_args()
+
+    if args.embed_model:
+        os.environ['EMBED_MODEL'] = args.embed_model
+
     start = datetime.utcnow()
-    print(f"Starting full setup at {start.isoformat()}Z")
+    print(f"Starting setup at {start.isoformat()}Z")
 
-    # 1) fetch
-    fetch_all_courtlistener()
-    fetch_all_uscode()
-    fetch_all_ecfr()
+    # fetch
+    fetch_courtlistener(target_cases=args.cases, max_pages=args.case_pages)
+    fetch_uscode(target_granules=args.granules, max_pages=args.granule_pages)
+    fetch_ecfr(titles_to_check=args.ecfr_titles)
 
-    # 2) preprocess + index
-    stats = preprocess_and_index()
+    # preprocess + index
+    if args.reindex:
+        preprocess_and_index()
 
     end = datetime.utcnow()
-    print(f"Completed full setup at {end.isoformat()}Z — duration: {end - start}")
-    print(f"Final index stats: {stats}")
+    print(f"Completed setup at {end.isoformat()}Z — duration: {end - start}")
 
 
 if __name__ == '__main__':

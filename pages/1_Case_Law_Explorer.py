@@ -7,6 +7,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.rag.retriever import Retriever
+from src.ui_helpers import format_distance
 
 st.set_page_config(page_title="Case Law Explorer", layout="wide")
 st.title("⚖️ Case Law Explorer")
@@ -18,6 +19,9 @@ def load_retriever():
     return Retriever()
 
 retriever = load_retriever()
+counts = retriever.indexer.get_entity_counts()
+
+st.metric("Cases stored", counts.get("cases", 0))
 
 col1, col2 = st.columns([2, 1])
 
@@ -37,7 +41,7 @@ if query:
                 st.success(f"Found {len(results)} matching documents")
                 
                 for i, result in enumerate(results, 1):
-                    with st.expander(f"**{i}. {result['metadata'].get('case_name', 'Unknown Case')}** (Distance: {result.get('distance', 0):.3f})", expanded=i==1):
+                    with st.expander(f"**{i}. {result['metadata'].get('case_name', 'Unknown Case')}** (Distance: {format_distance(result.get('distance'))})", expanded=i==1):
                         col_meta, col_text = st.columns([1, 2])
                         
                         with col_meta:
@@ -60,7 +64,8 @@ if query:
                                 value=result['text'][:500] + "..." if len(result['text']) > 500 else result['text'],
                                 height=200,
                                 disabled=True,
-                                label_visibility="collapsed"
+                                label_visibility="collapsed",
+                                key=f"case_text_{i}"
                             )
             else:
                 st.info("No matching cases found. Try a different query.")

@@ -7,6 +7,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.rag.retriever import Retriever
+from src.ui_helpers import format_distance
 
 st.set_page_config(page_title="Statute & Regulation Lookup", layout="wide")
 st.title("📋 Statute & Regulation Lookup")
@@ -17,6 +18,13 @@ def load_retriever():
     return Retriever()
 
 retriever = load_retriever()
+counts = retriever.indexer.get_entity_counts()
+
+count_col1, count_col2 = st.columns(2)
+with count_col1:
+    st.metric("U.S. Code sections stored", counts.get("statutes", 0))
+with count_col2:
+    st.metric("CFR sections stored", counts.get("regulations", 0))
 
 tab1, tab2 = st.tabs(["U.S. Code (Statutes)", "Code of Federal Regulations (CFR)"])
 
@@ -47,7 +55,7 @@ with tab1:
                         meta = result['metadata']
                         
                         title_str = f"{meta.get('usc_citation', 'Unknown')} - {meta.get('section_heading', '')}"
-                        with st.expander(f"**{i}. {title_str}** (Distance: {result.get('distance', 0):.3f})", expanded=i==1):
+                        with st.expander(f"**{i}. {title_str}** (Distance: {format_distance(result.get('distance'))})", expanded=i==1):
                             col_meta, col_text = st.columns([1, 2])
                             
                             with col_meta:
@@ -99,7 +107,7 @@ with tab2:
                         meta = result['metadata']
                         
                         title_str = f"{meta.get('cfr_citation', 'Unknown')} - {meta.get('section_heading', '')}"
-                        with st.expander(f"**{i}. {title_str}** (Distance: {result.get('distance', 0):.3f})", expanded=i==1):
+                        with st.expander(f"**{i}. {title_str}** (Distance: {format_distance(result.get('distance'))})", expanded=i==1):
                             col_meta, col_text = st.columns([1, 2])
                             
                             with col_meta:

@@ -14,6 +14,7 @@ from src.data.ecfr import ECFRClient
 from src.data.preprocessor import Preprocessor
 from src.rag.indexer import Indexer
 from src.config import Config
+from scripts.setup_full import fetch_courtlistener, fetch_uscode, fetch_ecfr, preprocess_and_index
 
 st.set_page_config(page_title="Data Refresh")
 st.title("Data Refresh")
@@ -113,6 +114,8 @@ st.write("Use the controls below to run an incremental data update. You can opti
 
 run_reindex = st.checkbox("After fetch, rebuild processed data and vector index", value=True)
 ecfr_titles_to_check = st.slider("eCFR titles to check (newest first)", min_value=2, max_value=50, value=10, step=2)
+cases_to_fetch = st.number_input("Max court opinions to fetch", min_value=1, max_value=5000, value=100, step=50)
+granules_to_fetch = st.number_input("Max US Code granules to fetch", min_value=1, max_value=2000, value=50, step=10)
 
 if st.button("Update Database"):
 	status = st.empty()
@@ -129,15 +132,41 @@ if st.button("Update Database"):
 	mode = "with reindex" if run_reindex else "fetch-only"
 	status.text(f"Starting incremental update ({mode})...")
 	try:
-		results = _update_all(progress_callback=cb, run_reindex=run_reindex, ecfr_titles_to_check=ecfr_titles_to_check)
+		# Fetch courtlistener (incremental)
+		status.text("Fetching CourtListener...")
+		prog.progress(5)
+		saved_cases = fetch_courtlistener(target_cases=int(cases_to_fetch), max_pages=Config.COURTLISTENER_MAX_PAGES, skip_existing=True)
+		prog.progress(30)
+		status.text(f"CourtListener: saved {len(saved_cases)} new items")
+
+		# Fetch US Code
+		status.text("Fetching U.S. Code granules...")
+		saved_us = fetch_uscode(target_granules=int(granules_to_fetch), max_pages=2)
+		prog.progress(60)
+		status.text(f"USC: processed {len(saved_us)} granules")
+
+		# Fetch eCFR
+		status.text("Fetching eCFR titles...")
+		saved_ecfr = fetch_ecfr(titles_to_check=ecfr_titles_to_check)
+		prog.progress(80)
+		status.text(f"eCFR: saved {saved_ecfr} new titles")
+
+		results = {"courtlistener": len(saved_cases), "uscode": len(saved_us), "ecfr": saved_ecfr}
+
+		if run_reindex:
+			status.text("Preprocessing and indexing...")
+			prog.progress(85)
+			stats = preprocess_and_index()
+			prog.progress(98)
+			results.update({"index_stats": stats})
+
 		prog.progress(100)
 		status.text(f"Update complete: {results}")
 		st.success("Update finished")
-		if run_reindex:
-			try:
-				st.cache_resource.clear()
-			except Exception:
-				pass
+		try:
+			st.cache_resource.clear()
+		except Exception:
+			pass
 		st.json(results)
 	except Exception as e:
 		status.text(f"Update failed: {e}")

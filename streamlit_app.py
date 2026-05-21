@@ -12,6 +12,7 @@ from src.observability.logger import get_logger
 from src.config import Config, get_device
 from src.documents.session_store import SessionDocumentStore
 from src.agent.graph import run_query
+from src.ui_helpers import average_relevance, coerce_distance
 
 logger = get_logger(__name__)
 
@@ -85,6 +86,55 @@ if st.sidebar.button("Clear Chat History"):
 st.title("⚖️ LexIQ — Legal Research Assistant")
 st.write("Ask questions about U.S. case law, statutes, and regulations. LexIQ will search its knowledge base and provide sourced answers.")
 
+
+def _source_key(source: dict) -> tuple:
+    return (
+        source.get("type"),
+        source.get("citation"),
+    )
+
+
+def _source_status_rank(status: str | None) -> int:
+    return 1 if status == "used" else 0
+
+
+def _dedupe_sources(sources: list[dict]) -> list[dict]:
+    seen: dict[tuple, dict] = {}
+    for source in sources:
+        key = _source_key(source)
+        existing = seen.get(key)
+        if existing is None or _source_status_rank(source.get("status")) > _source_status_rank(existing.get("status")):
+            seen[key] = source
+    return list(seen.values())
+
+
+def _normalize_display_source_type(source_type: str | None) -> str:
+    mapping = {
+        'CASE': 'Case Law',
+        'CASE LAW': 'Case Law',
+        'STATUTE': 'U.S. Code',
+        'U.S. CODE': 'U.S. Code',
+        'REGULATION': 'Regulation',
+        'SESSION': 'Session Doc',
+    }
+    if not source_type:
+        return 'Source'
+    return mapping.get(source_type.upper(), source_type)
+
+
+def _render_source_badge(status: str | None) -> str:
+    if status == "used":
+        return (
+            "<span style=\"display:inline-block;padding:0.1rem 0.45rem;border-radius:999px;"
+            "background:#166534;color:white;font-size:0.72rem;font-weight:700;line-height:1.4;\">"
+            "USED</span>"
+        )
+    return (
+        "<span style=\"display:inline-block;padding:0.1rem 0.45rem;border-radius:999px;"
+        "background:#6b7280;color:white;font-size:0.72rem;font-weight:700;line-height:1.4;\">"
+        "RETRIEVED</span>"
+    )
+
 # Display chat history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -141,22 +191,37 @@ if query:
                 if st.session_state.get("uploaded_docs"):
                     st.info(f"📄 **Context from uploaded documents:** {len(st.session_state.uploaded_docs)} document(s) included in search")
                 
-                # Collect sources from results
+                # Collect sources from results. Prefer showing the sources actually included in the prompt (used_sources) when available.
                 sources = []
-                try:
-                    cases = result.get('retrieved_cases', []) if isinstance(result.get('retrieved_cases'), list) else []
-                    for case in cases:
-                        if isinstance(case, dict):
-                            meta = case.get('metadata', {})
-                            case_name = meta.get('case_name', 'Unknown')
-                            citation = meta.get('bluebook_cite') or case_name
-                            sources.append({
-                                "type": "Case Law",
-                                "citation": citation,
-                                "distance": case.get('distance', 0)
-                            })
-                except Exception as e:
-                    logger.warning(f"Error processing cases: {str(e)}")
+                used = result.get('used_sources') or []
+                used_source_keys = set()
+                if used:
+                    # used_sources entries are dicts with keys: type, citation, score, distance
+                    for u in used:
+                        try:
+                            t = _normalize_display_source_type(u.get('type'))
+                            citation = u.get('citation') or 'Unknown'
+                            source = {"type": t, "citation": citation, "distance": coerce_distance(u.get('distance')), "status": "used"}
+                            sources.append(source)
+                            used_source_keys.add(_source_key(source))
+                        except Exception:
+                            continue
+                else:
+                    try:
+                        cases = result.get('retrieved_cases', []) if isinstance(result.get('retrieved_cases'), list) else []
+                        for case in cases:
+                            if isinstance(case, dict):
+                                meta = case.get('metadata', {})
+                                case_name = meta.get('case_name', 'Unknown')
+                                citation = meta.get('bluebook_cite') or case_name
+                                sources.append({
+                                    "type": "Case Law",
+                                    "citation": citation,
+                                    "distance": coerce_distance(case.get('distance')),
+                                    "status": "retrieved",
+                                })
+                    except Exception as e:
+                        logger.warning(f"Error processing cases: {str(e)}")
                 
                 try:
                     statutes = result.get('retrieved_statutes', []) if isinstance(result.get('retrieved_statutes'), list) else []
@@ -167,7 +232,8 @@ if query:
                             sources.append({
                                 "type": "U.S. Code",
                                 "citation": citation,
-                                "distance": statute.get('distance', 0)
+                                "distance": coerce_distance(statute.get('distance')),
+                                "status": "retrieved" if _source_key({"type": "U.S. Code", "citation": citation}) not in used_source_keys else "used",
                             })
                 except Exception as e:
                     logger.warning(f"Error processing statutes: {str(e)}")
@@ -181,16 +247,27 @@ if query:
                             sources.append({
                                 "type": "Regulation",
                                 "citation": citation,
-                                "distance": reg.get('distance', 0)
+                                "distance": coerce_distance(reg.get('distance')),
+                                "status": "retrieved" if _source_key({"type": "Regulation", "citation": citation}) not in used_source_keys else "used",
                             })
                 except Exception as e:
                     logger.warning(f"Error processing regulations: {str(e)}")
                 
+                sources = _dedupe_sources(sources)
+
+                used_count = len([s for s in sources if s.get('status') == 'used'])
+                retrieved_only_count = len(sources) - used_count
+
                 # Display sources
                 if sources:
                     with st.expander(f"📎 Sources ({len(sources)})", expanded=True):
+                        st.caption(f"{used_count} used in prompt, {retrieved_only_count} retrieved only")
                         for source in sources:
-                            st.write(f"**{source['type']}**: {source['citation']}")
+                            badge = _render_source_badge(source.get('status'))
+                            st.markdown(
+                                f"**{source['type']}**: {source['citation']} {badge}",
+                                unsafe_allow_html=True,
+                            )
                 
                 # Calculate and display metrics
                 metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
@@ -211,18 +288,18 @@ if query:
                 # Calculate average relevance scores (1 - distance, normalized)
                 if cases_retrieved > 0:
                     cases = [s for s in sources if s['type'] == 'Case Law']
-                    avg_case_score = sum(1 - s.get('distance', 0) for s in cases) / cases_retrieved
-                    st.write(f"**Case Relevance Score:** {avg_case_score:.1%}")
+                    avg_case_score = average_relevance(cases)
+                    st.write(f"**Case Relevance Score:** {avg_case_score:.1%}" if avg_case_score is not None else "**Case Relevance Score:** n/a")
                 
                 if statutes_retrieved > 0:
                     statutes = [s for s in sources if s['type'] == 'U.S. Code']
-                    avg_stat_score = sum(1 - s.get('distance', 0) for s in statutes) / statutes_retrieved
-                    st.write(f"**Statute Relevance Score:** {avg_stat_score:.1%}")
+                    avg_stat_score = average_relevance(statutes)
+                    st.write(f"**Statute Relevance Score:** {avg_stat_score:.1%}" if avg_stat_score is not None else "**Statute Relevance Score:** n/a")
                 
                 if regs_retrieved > 0:
                     regs = [s for s in sources if s['type'] == 'Regulation']
-                    avg_reg_score = sum(1 - s.get('distance', 0) for s in regs) / regs_retrieved
-                    st.write(f"**Regulation Relevance Score:** {avg_reg_score:.1%}")
+                    avg_reg_score = average_relevance(regs)
+                    st.write(f"**Regulation Relevance Score:** {avg_reg_score:.1%}" if avg_reg_score is not None else "**Regulation Relevance Score:** n/a")
                 
                 # Overall coverage metric
                 total_sources = cases_retrieved + statutes_retrieved + regs_retrieved

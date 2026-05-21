@@ -29,3 +29,12 @@ lint:
 
 clean:
 	rm -rf chroma_db/ data/raw/ data/processed/ logs/ .venv/
+
+# Custom setup target: allow overriding counts via make variables
+# Usage: `make setup-custom CASES=1000 GRANULES=500 ECFR_TITLES=5`
+CASES ?= 1000
+GRANULES ?= 500
+ECFR_TITLES ?= 5
+
+setup-custom:
+	.venv/bin/python scripts/setup_full.py --cases $(CASES) --granules $(GRANULES) --ecfr-titles $(ECFR_TITLES)

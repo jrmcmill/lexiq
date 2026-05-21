@@ -17,7 +17,8 @@ class USCodeClient:
         self.api_key = Config.GOVINFO_API_KEY
         self.raw_dir = os.path.join(os.getcwd(), "data", "raw", "uscode")
         self.page_size = 50
-        self.max_pages = 5
+        # None means fetch until the API indicates no more results
+        self.max_pages = None
         os.makedirs(self.raw_dir, exist_ok=True)
 
     def _request(self, method: str, url: str, **kwargs):
@@ -32,20 +33,23 @@ class USCodeClient:
         return self.fetch_sections()
 
     def fetch_sections(self, query: str = "collection:uscode", max_pages: Optional[int] = None,
-                       page_size: Optional[int] = None, sort_by: str = "DATE") -> List[dict]:
+                       page_size: Optional[int] = None, sort_by: str = "DATE",
+                       stop_after_count: Optional[int] = None) -> List[dict]:
         if not self.api_key:
             logger.warning("GOVINFO_API_KEY not set. Skipping USC fetch.")
             return []
 
         page_size = page_size or self.page_size
-        max_pages = max_pages or self.max_pages
+        # if caller passes None, use unlimited loop until no next_mark
+        max_pages = max_pages if max_pages is not None else self.max_pages
         results: List[dict] = []
         offset_mark = "*"
         page = 0
         effective_sort = sort_by
         pbar = tqdm(total=max_pages, desc="US Code", unit="page")
 
-        while page < max_pages:
+        # If max_pages is None, loop until no next_mark returned by API
+        while True if max_pages is None else page < max_pages:
             payload = {
                 "query": query,
                 "pageSize": page_size,
@@ -71,8 +75,14 @@ class USCodeClient:
                 html = self._fetch_granule_html(item)
                 saved = self._save_granule(item, html)
                 results.append(saved)
+                # stop if we reached a requested total count of granules
+                if stop_after_count and len(results) >= stop_after_count:
+                    logger.info(f"Reached stop_after_count={stop_after_count}; stopping USC fetch")
+                    break
 
             next_mark = data.get("offsetMark")
+            if stop_after_count and len(results) >= stop_after_count:
+                break
             if not next_mark or next_mark == offset_mark:
                 break
             offset_mark = next_mark

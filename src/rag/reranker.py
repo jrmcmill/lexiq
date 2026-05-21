@@ -28,4 +28,12 @@ class Reranker:
         for r, s in zip(results, scores):
             r['rerank_score'] = float(s)
         results_sorted = sorted(results, key=lambda r: r['rerank_score'], reverse=True)
-        return results_sorted[:top_k]
+        
+        # Apply minimum score threshold before returning top_k
+        min_score = Config.RERANK_MIN_SCORE
+        filtered = [r for r in results_sorted if r['rerank_score'] >= min_score]
+        
+        if len(filtered) < len(results_sorted):
+            logger.info(f"Reranker filtered {len(results_sorted) - len(filtered)} results below min_score {min_score}")
+        
+        return filtered[:top_k]

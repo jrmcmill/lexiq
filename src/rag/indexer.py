@@ -5,6 +5,7 @@ from src.config import Config
 from src.rag.embedder import Embedder
 from src.observability.logger import get_logger
 import os
+from src.rag.bm25_index import BM25Index
 
 logger = get_logger(__name__)
 
@@ -15,7 +16,13 @@ class Indexer:
         self.cases = self._get_collection(Config.CHROMA_CASES_COLLECTION)
         self.statutes = self._get_collection(Config.CHROMA_STATUTES_COLLECTION)
         self.regs = self._get_collection(Config.CHROMA_REGULATIONS_COLLECTION)
+        self.titles = self._get_collection(Config.CHROMA_TITLES_COLLECTION)
         self.embedder = Embedder()
+        # BM25 indexes persisted alongside Chroma DB
+        self.bm25_cases = BM25Index(persist, "cases")
+        self.bm25_statutes = BM25Index(persist, "statutes")
+        self.bm25_regs = BM25Index(persist, "regs")
+        self.bm25_titles = BM25Index(persist, "titles")
 
     def _get_collection(self, name):
         try:
@@ -61,16 +68,61 @@ class Indexer:
         if not ids:
             logger.info("No case chunks to index")
             return
-        embeddings = self.embedder.embed(texts)
-        try:
-            self.cases.upsert(ids=ids, documents=texts, metadatas=metadatas, embeddings=embeddings)
-            logger.info(f"Indexed {len(ids)} case chunks")
-        except Exception as e:
-            logger.error(f"Error upserting cases: {e}")
+        # Upsert in batches to reduce peak memory during embedding
+        batch_size = 256
+        all_ids = []
+        all_texts = []
+        from tqdm import tqdm as _tqdm
+        for i in _tqdm(range(0, len(ids), batch_size), desc="Embedding+Upserting Cases", unit="batch"):
+            batch_ids = ids[i:i+batch_size]
+            batch_texts = texts[i:i+batch_size]
+            batch_metas = metadatas[i:i+batch_size]
+            embeddings = self.embedder.embed(batch_texts)
             try:
-                self.cases.upsert(ids=ids, documents=texts, metadatas=metadatas)
-            except Exception as e2:
-                logger.error(f"Fallback upsert also failed: {e2}")
+                self.cases.upsert(ids=batch_ids, documents=batch_texts, metadatas=batch_metas, embeddings=embeddings)
+            except Exception as e:
+                logger.warning(f"Batch upsert failed for cases: {e}; retrying without embeddings")
+                try:
+                    self.cases.upsert(ids=batch_ids, documents=batch_texts, metadatas=batch_metas)
+                except Exception as e2:
+                    logger.error(f"Fallback batch upsert also failed: {e2}")
+            all_ids.extend(batch_ids)
+            all_texts.extend(batch_texts)
+        logger.info(f"Indexed {len(all_ids)} case chunks (batched)")
+        ids = all_ids
+        texts = all_texts
+        # build BM25 on chunk texts
+        try:
+            self.bm25_cases.build(ids, texts)
+            logger.info("Built BM25 index for cases")
+        except Exception as e:
+            logger.warning(f"Could not build BM25 for cases: {e}")
+
+        # build title entries: unique parent opinion id -> case name
+        try:
+            title_ids = []
+            title_texts = []
+            title_metas = []
+            seen = set()
+            for m in metadatas:
+                pid = m.get('parent_opinion_id')
+                name = m.get('case_name') or ''
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    tid = f"title_case_{pid}"
+                    title_ids.append(tid)
+                    title_texts.append(name)
+                    title_metas.append({'parent_opinion_id': pid, 'case_name': name, 'source': 'case'})
+            if title_ids:
+                self.titles.upsert(ids=title_ids, documents=title_texts, metadatas=title_metas)
+                try:
+                    self.bm25_titles.build(title_ids, title_texts)
+                except Exception:
+                    # ignore bm25 build failure for titles
+                    pass
+                logger.info(f"Indexed {len(title_ids)} case titles")
+        except Exception as e:
+            logger.warning(f"Could not index case titles: {e}")
 
     def index_statutes(self, df):
         if df.empty:
@@ -101,12 +153,54 @@ class Indexer:
         if not ids:
             logger.info("No statute chunks to index")
             return
-        embeddings = self.embedder.embed(texts)
+        # Upsert in batches
+        batch_size = 256
+        all_ids = []
+        all_texts = []
+        from tqdm import tqdm as _tqdm
+        for i in _tqdm(range(0, len(ids), batch_size), desc="Embedding+Upserting Statutes", unit="batch"):
+            batch_ids = ids[i:i+batch_size]
+            batch_texts = texts[i:i+batch_size]
+            batch_metas = metadatas[i:i+batch_size]
+            embeddings = self.embedder.embed(batch_texts)
+            try:
+                self.statutes.upsert(ids=batch_ids, documents=batch_texts, metadatas=batch_metas, embeddings=embeddings)
+            except Exception as e:
+                logger.warning(f"Batch upsert failed for statutes: {e}")
+            all_ids.extend(batch_ids)
+            all_texts.extend(batch_texts)
+        logger.info(f"Indexed {len(all_ids)} statute chunks (batched)")
+        ids = all_ids
+        texts = all_texts
         try:
-            self.statutes.upsert(ids=ids, documents=texts, metadatas=metadatas, embeddings=embeddings)
-            logger.info(f"Indexed {len(ids)} statute chunks")
+            self.bm25_statutes.build(ids, texts)
+            logger.info("Built BM25 index for statutes")
         except Exception as e:
-            logger.error(f"Error upserting statutes: {e}")
+            logger.warning(f"Could not build BM25 for statutes: {e}")
+
+        # index statute titles/headings
+        try:
+            title_ids = []
+            title_texts = []
+            title_metas = []
+            for m, _id in zip(metadatas, ids):
+                heading = m.get('section_heading') or ''
+                if heading:
+                    tid = f"title_stat_{_id}"
+                    title_ids.append(tid)
+                    title_texts.append(heading)
+                    title_metas.append({'source': 'statute', 'ref_id': _id})
+            if title_ids:
+                self.titles.upsert(ids=title_ids, documents=title_texts, metadatas=title_metas)
+                try:
+                    res = self.titles.get()
+                    docs = res.get('documents', [])
+                    ids_all = res.get('ids', [])
+                    self.bm25_titles.build(ids_all, docs)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Could not index statute titles: {e}")
 
     def index_regulations(self, df):
         if df.empty:
@@ -129,12 +223,54 @@ class Indexer:
         if not ids:
             logger.info("No regulation chunks to index")
             return
-        embeddings = self.embedder.embed(texts)
+        # Upsert in batches
+        batch_size = 256
+        all_ids = []
+        all_texts = []
+        from tqdm import tqdm as _tqdm
+        for i in _tqdm(range(0, len(ids), batch_size), desc="Embedding+Upserting Regs", unit="batch"):
+            batch_ids = ids[i:i+batch_size]
+            batch_texts = texts[i:i+batch_size]
+            batch_metas = metadatas[i:i+batch_size]
+            embeddings = self.embedder.embed(batch_texts)
+            try:
+                self.regs.upsert(ids=batch_ids, documents=batch_texts, metadatas=batch_metas, embeddings=embeddings)
+            except Exception as e:
+                logger.warning(f"Batch upsert failed for regs: {e}")
+            all_ids.extend(batch_ids)
+            all_texts.extend(batch_texts)
+        logger.info(f"Indexed {len(all_ids)} regulation chunks (batched)")
+        ids = all_ids
+        texts = all_texts
         try:
-            self.regs.upsert(ids=ids, documents=texts, metadatas=metadatas, embeddings=embeddings)
-            logger.info(f"Indexed {len(ids)} regulation chunks")
+            self.bm25_regs.build(ids, texts)
+            logger.info("Built BM25 index for regulations")
         except Exception as e:
-            logger.error(f"Error upserting regulations: {e}")
+            logger.warning(f"Could not build BM25 for regulations: {e}")
+
+        # index regulation titles/headings
+        try:
+            title_ids = []
+            title_texts = []
+            title_metas = []
+            for m, _id in zip(metadatas, ids):
+                heading = m.get('section_heading') or ''
+                if heading:
+                    tid = f"title_reg_{_id}"
+                    title_ids.append(tid)
+                    title_texts.append(heading)
+                    title_metas.append({'source': 'regulation', 'ref_id': _id})
+            if title_ids:
+                self.titles.upsert(ids=title_ids, documents=title_texts, metadatas=title_metas)
+                try:
+                    res = self.titles.get()
+                    docs = res.get('documents', [])
+                    ids_all = res.get('ids', [])
+                    self.bm25_titles.build(ids_all, docs)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Could not index regulation titles: {e}")
 
     def get_collection_stats(self):
         return {
@@ -142,6 +278,41 @@ class Indexer:
             'statutes': getattr(self.statutes, 'count', lambda: 0)(),
             'regulations': getattr(self.regs, 'count', lambda: 0)(),
         }
+
+    def get_entity_counts(self):
+        return {
+            'cases': self._count_unique_entities(self.cases, lambda meta: meta.get('parent_opinion_id')),
+            'statutes': self._count_unique_entities(
+                self.statutes,
+                lambda meta: (meta.get('title_number'), meta.get('section_number')),
+            ),
+            'regulations': self._count_unique_entities(
+                self.regs,
+                lambda meta: (meta.get('cfr_title'), meta.get('cfr_part'), meta.get('cfr_section')),
+            ),
+        }
+
+    def _count_unique_entities(self, collection, key_fn):
+        try:
+            payload = collection.get()
+        except Exception:
+            return 0
+
+        metadatas = payload.get('metadatas', []) or []
+        unique_keys = set()
+        for meta in metadatas:
+            if not isinstance(meta, dict):
+                continue
+            key = key_fn(meta)
+            if key is None:
+                continue
+            if isinstance(key, tuple):
+                if not any(str(part).strip() for part in key):
+                    continue
+            elif not str(key).strip():
+                continue
+            unique_keys.add(key)
+        return len(unique_keys)
 
     def create_session_collection(self, session_id: str):
         name = f"session_{session_id}"
