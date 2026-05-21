@@ -73,7 +73,8 @@ with tab1:
                                     value=result['text'],
                                     height=300,
                                     disabled=True,
-                                    label_visibility="collapsed"
+                                    label_visibility="collapsed",
+                                    key=f"statute_text_{i}"
                                 )
                 else:
                     st.info("No matching statutes found.")
@@ -126,7 +127,8 @@ with tab2:
                                     value=result['text'],
                                     height=300,
                                     disabled=True,
-                                    label_visibility="collapsed"
+                                    label_visibility="collapsed",
+                                    key=f"reg_text_{i}"
                                 )
                 else:
                     st.info("No matching regulations found.")
