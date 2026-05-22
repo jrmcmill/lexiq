@@ -9,6 +9,9 @@ class DummyCollection:
 class DummyIndexer:
     def __init__(self):
         self.cases = DummyCollection()
+        self.statutes = DummyCollection()
+        self.regs = DummyCollection()
+        self.titles = None
 
 @pytest.fixture
 def retriever(monkeypatch):
@@ -16,7 +19,14 @@ def retriever(monkeypatch):
     # monkeypatch the indexer to use dummy
     r.indexer = MagicMock()
     r.indexer.cases = DummyCollection()
+    r.indexer.statutes = DummyCollection()
+    r.indexer.regs = DummyCollection()
+    r.indexer.titles = None
     r.indexer.client = MagicMock()
+    r.bm25_cases = MagicMock(query=lambda q, top_k: [])
+    r.bm25_statutes = MagicMock(query=lambda q, top_k: [])
+    r.bm25_regs = MagicMock(query=lambda q, top_k: [])
+    r.bm25_titles = None
     return r
 
 def test_retrieve_cases_rerank(monkeypatch, retriever):
@@ -25,6 +35,27 @@ def test_retrieve_cases_rerank(monkeypatch, retriever):
     res = retriever.retrieve_cases('test')
     assert isinstance(res, list)
     assert len(res) == 2
+    assert all('score' in item for item in res)
+
+
+def test_hybrid_score_prefers_strong_title_signal():
+    r = Retriever()
+    case_with_title = r._combine_scores('cases', 'smith v jones', semantic_score=0.20, bm25_score=0.10, title_score=0.90)
+    case_without_title = r._combine_scores('cases', 'smith v jones', semantic_score=0.70, bm25_score=0.10, title_score=0.0)
+    assert case_with_title > case_without_title
+
+
+def test_finalize_results_blends_hybrid_and_rerank(monkeypatch, retriever):
+    candidates = [
+        {'text': 'doc1', 'metadata': {'bluebook_cite': 'A'}, 'hybrid_score': 0.9, 'distance': 0.1, 'semantic_score': 0.8, 'bm25_score': 0.9, 'title_score': 0.2},
+        {'text': 'doc2', 'metadata': {'bluebook_cite': 'B'}, 'hybrid_score': 0.2, 'distance': 0.2, 'semantic_score': 0.2, 'bm25_score': 0.1, 'title_score': 0.0},
+    ]
+    monkeypatch.setattr(retriever, 'reranker', MagicMock(rerank=lambda q, r, top_k=None: [dict(r[1], rerank_score=0.95), dict(r[0], rerank_score=0.30)]))
+    res = retriever._finalize_results('query', candidates, 'cases', 2)
+    assert len(res) == 2
+    assert res[0]['score'] >= res[1]['score']
+    assert 'hybrid_score' in res[0]
+    assert 'rerank_score' in res[0]
 
 
 def test_expand_query_variants():
@@ -48,7 +79,7 @@ def test_retrieve_cases_deduplicates(monkeypatch, retriever):
             }
 
     retriever.indexer.cases = DupCollection()
-    retriever.bm25_cases = MagicMock(top_ids=lambda q, top_k: [])
+    retriever.bm25_cases = MagicMock(query=lambda q, top_k: [])
     monkeypatch.setattr(retriever, 'reranker', MagicMock(rerank=lambda q, r: [dict(x, rerank_score=1.0) for x in r]))
 
     res = retriever.retrieve_cases('test')

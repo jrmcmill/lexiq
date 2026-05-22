@@ -45,6 +45,8 @@ class Config:
     REQUIRE_SOURCES: bool = os.getenv("REQUIRE_SOURCES", "true").lower() == "true"
     # Enable query expansion (topical synonyms). Set to false to disable.
     ENABLE_QUERY_EXPANSION: bool = os.getenv("ENABLE_QUERY_EXPANSION", "true").lower() == "true"
+    # When true, retrieval methods may return a debug trace along with results
+    RETRIEVAL_DEBUG: bool = os.getenv("RETRIEVAL_DEBUG", "false").lower() == "true"
 
 def get_device():
     if torch.cuda.is_available():

@@ -30,6 +30,7 @@ class Retriever:
         self.indexer = Indexer()
         self.embedder = Embedder()
         self.reranker = Reranker()
+        self.retrieval_debug = Config.RETRIEVAL_DEBUG
         # load BM25 indexes (if present)
         persist = Config.CHROMA_PERSIST_DIR
         self.bm25_cases = BM25Index(persist, "cases")
@@ -44,8 +45,209 @@ class Retriever:
         except Exception:
             pass
 
+    def _safe_float(self, value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number or number in (float('inf'), float('-inf')):
+            return None
+        return number
+
+    def _distance_to_similarity(self, distance):
+        value = self._safe_float(distance)
+        if value is None:
+            return 0.0
+        return max(0.0, min(1.0, 1.0 - value))
+
+    def _normalize_bm25_score(self, score, top_score):
+        score_value = self._safe_float(score)
+        top_value = self._safe_float(top_score)
+        if score_value is None or top_value is None or top_value <= 0:
+            return 0.0
+        return max(0.0, min(1.0, score_value / top_value))
+
+    def _source_weights(self, source_kind: str, query: str) -> dict[str, float]:
+        base_weights = {
+            'cases': {'semantic': 0.42, 'content': 0.23, 'title': 0.30, 'synergy': 0.05},
+            'statutes': {'semantic': 0.50, 'content': 0.33, 'title': 0.12, 'synergy': 0.05},
+            'regs': {'semantic': 0.50, 'content': 0.33, 'title': 0.12, 'synergy': 0.05},
+            'session': {'semantic': 0.85, 'content': 0.15, 'title': 0.0, 'synergy': 0.0},
+        }
+        weights = dict(base_weights.get(source_kind, base_weights['statutes']))
+        normalized_query = self._normalize_query(query)
+
+        if source_kind == 'cases' and (' v ' in f' {normalized_query} ' or 'v.' in normalized_query or ' vs ' in f' {normalized_query} '):
+            weights['title'] += 0.08
+            weights['content'] -= 0.03
+            weights['semantic'] -= 0.05
+
+        if source_kind in {'statutes', 'regs'} and (
+            any(token in normalized_query for token in ('section', 'usc', 'cfr', 'title', 'part')) or any(ch.isdigit() for ch in normalized_query)
+        ):
+            weights['title'] += 0.05
+            weights['content'] += 0.02
+            weights['semantic'] -= 0.07
+
+        total = sum(max(value, 0.0) for value in weights.values()) or 1.0
+        return {key: max(value, 0.0) / total for key, value in weights.items()}
+
+    def _combine_scores(self, source_kind: str, query: str, semantic_score: float, bm25_score: float, title_score: float) -> float:
+        weights = self._source_weights(source_kind, query)
+        semantic = max(0.0, min(1.0, semantic_score or 0.0))
+        bm25 = max(0.0, min(1.0, bm25_score or 0.0))
+        title = max(0.0, min(1.0, title_score or 0.0))
+
+        synergy = 0.0
+        if semantic > 0 and bm25 > 0:
+            synergy += weights['synergy'] * min(semantic, bm25)
+        if title > 0 and source_kind == 'cases' and semantic > 0:
+            synergy += 0.03 * min(semantic, title)
+        if title > 0 and source_kind in {'statutes', 'regs'} and bm25 > 0:
+            synergy += 0.02 * min(bm25, title)
+
+        return (
+            weights['semantic'] * semantic
+            + weights['content'] * bm25
+            + weights['title'] * title
+            + synergy
+        )
+
+    def _rerank_blend_weights(self, source_kind: str) -> tuple[float, float]:
+        if source_kind == 'cases':
+            return (0.58, 0.42)
+        if source_kind in {'statutes', 'regs'}:
+            return (0.52, 0.48)
+        return (0.50, 0.50)
+
+    def _finalize_results(self, query: str, candidates: list[dict], source_kind: str, n_results: int) -> list[dict]:
+        if not candidates:
+            return []
+
+        candidate_ordered = sorted(candidates, key=lambda item: item.get('hybrid_score', 0.0), reverse=True)
+        rerank_limit = min(len(candidate_ordered), max(n_results, Config.RERANK_TOP_K, n_results * 2))
+        try:
+            reranked = self.reranker.rerank(query, candidate_ordered, top_k=rerank_limit)
+        except Exception as exc:
+            logger.warning(f"Reranker failed, falling back to hybrid scores: {exc}")
+            reranked = candidate_ordered[:rerank_limit]
+
+        if not reranked:
+            return candidate_ordered[:n_results]
+
+        raw_scores = []
+        for item in reranked:
+            score = self._safe_float(item.get('rerank_score'))
+            if score is not None:
+                raw_scores.append(score)
+
+        min_rerank = min(raw_scores) if raw_scores else None
+        max_rerank = max(raw_scores) if raw_scores else None
+        hybrid_weight, rerank_weight = self._rerank_blend_weights(source_kind)
+
+        scored_results = []
+        for item in reranked:
+            rerank_raw = self._safe_float(item.get('rerank_score'))
+            if rerank_raw is None:
+                rerank_norm = item.get('hybrid_score', 0.0)
+            elif min_rerank is not None and max_rerank is not None and max_rerank > min_rerank:
+                rerank_norm = (rerank_raw - min_rerank) / (max_rerank - min_rerank)
+            else:
+                rerank_norm = 1.0
+
+            hybrid_score = max(0.0, min(1.0, self._safe_float(item.get('hybrid_score')) or 0.0))
+            final_score = (hybrid_weight * hybrid_score) + (rerank_weight * rerank_norm)
+            # compute contribution breakdown for transparency
+            try:
+                weights = self._source_weights(source_kind, query)
+            except Exception:
+                weights = {'semantic': 0.5, 'content': 0.3, 'title': 0.15, 'synergy': 0.05}
+            semantic = max(0.0, min(1.0, item.get('semantic_score') or 0.0))
+            bm25 = max(0.0, min(1.0, item.get('bm25_score') or 0.0))
+            title = max(0.0, min(1.0, item.get('title_score') or 0.0))
+            synergy_val = 0.0
+            if semantic > 0 and bm25 > 0:
+                synergy_val += weights.get('synergy', 0.0) * min(semantic, bm25)
+            if title > 0 and source_kind == 'cases' and semantic > 0:
+                synergy_val += 0.03 * min(semantic, title)
+            if title > 0 and source_kind in {'statutes', 'regs'} and bm25 > 0:
+                synergy_val += 0.02 * min(bm25, title)
+
+            contributions = {
+                'semantic': round(weights.get('semantic', 0.0) * semantic, 6),
+                'bm25': round(weights.get('content', 0.0) * bm25, 6),
+                'title': round(weights.get('title', 0.0) * title, 6),
+                'synergy': round(synergy_val, 6),
+                'rerank': round(rerank_norm * rerank_weight, 6),
+            }
+
+            scored_results.append({
+                'text': item.get('text', ''),
+                'metadata': item.get('metadata', {}),
+                'score': final_score,
+                'hybrid_score': hybrid_score,
+                'rerank_score': rerank_raw,
+                'distance': item.get('distance'),
+                'semantic_score': item.get('semantic_score'),
+                'bm25_score': item.get('bm25_score'),
+                'title_score': item.get('title_score'),
+                'contributions': contributions,
+                'source_id': item.get('source_id'),
+                'provenance': item.get('provenance') or {},
+            })
+
+        # provenance verification: require minimal citation/ID fields when configured
+        def _verify_provenance(item: dict) -> tuple[bool, str]:
+            meta = item.get('metadata') or {}
+            prov = item.get('provenance') or {}
+            # cases: prefer parent_opinion_id or bluebook_cite or case_name
+            if source_kind == 'cases':
+                if meta.get('parent_opinion_id') or prov.get('cite') or meta.get('case_name'):
+                    # check date not in future
+                    df = meta.get('date_filed')
+                    if df:
+                        try:
+                            from datetime import datetime, date
+                            parsed = datetime.fromisoformat(str(df)).date()
+                            if parsed > date.today():
+                                return (False, 'future_date')
+                        except Exception:
+                            pass
+                    return (True, '')
+                return (False, 'missing_case_id')
+            # statutes: require usc_citation or title_number+section_number
+            if source_kind == 'statutes':
+                if meta.get('usc_citation') or (meta.get('title_number') and meta.get('section_number')):
+                    return (True, '')
+                return (False, 'missing_statute_citation')
+            # regs: require cfr_citation or title/part/section
+            if source_kind == 'regs':
+                if meta.get('cfr_citation') or (meta.get('cfr_title') and (meta.get('cfr_part') or meta.get('cfr_section'))):
+                    return (True, '')
+                return (False, 'missing_reg_citation')
+            return (True, '')
+
+        # annotate verification and filter if configured to require sources
+        verified = []
+        removed_count = 0
+        for item in scored_results:
+            ok, reason = _verify_provenance(item)
+            item['provenance_verified'] = ok
+            if not ok and Config.REQUIRE_SOURCES:
+                removed_count += 1
+                continue
+            verified.append(item)
+
+        if removed_count > 0:
+            logger.info(f"Excluded {removed_count} results lacking required provenance ({source_kind})")
+
+        verified.sort(key=lambda item: item.get('score', 0.0), reverse=True)
+        key_fn = self._case_result_key if source_kind == 'cases' else self._statute_result_key if source_kind == 'statutes' else self._regulation_result_key
+        return self._dedupe_results(verified[:n_results], key_fn)
+
     def retrieve_cases(self, query: str, n_results: int = 20, court_filter: str | None = None,
-                       date_after: str | None = None, date_before: str | None = None) -> list[dict]:
+                       date_after: str | None = None, date_before: str | None = None,
+                       debug: bool = False):
         try:
             # Build where clause only if filters are present
             ands = []
@@ -57,137 +259,71 @@ class Retriever:
                 ands.append({"date_filed": {"$lte": date_before}})
 
             query_variants = self._expand_query_variants(query)
-            docs = self._collect_candidates(
+            docs, trace = self._collect_candidates(
                 collection=self.indexer.cases,
                 query_variants=query_variants,
                 n_results=n_results,
                 where={"$and": ands} if ands else None,
                 bm25_index=self.bm25_cases,
+                source_kind='cases',
             )
 
             if not docs:
                 logger.warning(f"No case results above relevance threshold {Config.RETRIEVAL_MIN_DISTANCE}")
                 return []
 
-            reranked = self.reranker.rerank(query, docs)
-            
-            # Filter by reranker score threshold
-            min_rerank = Config.RERANK_MIN_SCORE
-            out = []
-            for r in reranked:
-                if isinstance(r, dict):
-                    score = r.get('rerank_score')
-                    if score is not None and score >= min_rerank:
-                        out.append({
-                            'text': r.get('text', ''),
-                            'metadata': r.get('metadata', {}),
-                            'score': score,
-                            'distance': r.get('distance'),
-                        })
-            
-            if len(out) < len(reranked):
-                logger.info(f"Filtered out {len(reranked) - len(out)} low-scoring cases (score < {min_rerank})")
-            
+            out = self._finalize_results(query, docs, 'cases', n_results)
             if not out:
-                logger.warning(f"No case results above reranking threshold {min_rerank}")
-
-            return self._dedupe_results(out, self._case_result_key)
+                logger.warning(f"No case results above reranking threshold {Config.RERANK_MIN_SCORE}")
+            if debug or self.retrieval_debug:
+                return {'results': out, 'trace': trace}
+            return out
         except Exception as e:
             logger.error(f"Error in retrieve_cases: {str(e)}")
             return []
 
-    def retrieve_statutes(self, query: str, n_results: int = 20) -> list[dict]:
+    def retrieve_statutes(self, query: str, n_results: int = 20, debug: bool = False):
         try:
-            emb = self.embedder.embed_query(query)
-            if not emb or not isinstance(emb, list):
-                logger.error(f"Invalid embedding returned: {type(emb)}")
+            query_variants = self._expand_query_variants(query)
+            docs, trace = self._collect_candidates(
+                collection=self.indexer.statutes,
+                query_variants=query_variants,
+                n_results=n_results,
+                bm25_index=self.bm25_statutes,
+                source_kind='statutes',
+            )
+
+            if not docs:
+                logger.warning(f"No statute results above relevance threshold {Config.RETRIEVAL_MIN_DISTANCE}")
                 return []
-            
-            # embedding candidates
-            res = self.indexer.statutes.query(query_embeddings=[emb], n_results=n_results)
-            out = []
-            documents = res.get('documents', [[]])[0] if res.get('documents') else []
-            metadatas = res.get('metadatas', [[]])[0] if res.get('metadatas') else []
-            distances = res.get('distances', [[]])[0] if res.get('distances') else []
 
-            # Filter by distance threshold
-            min_dist = Config.RETRIEVAL_MIN_DISTANCE
-            filtered_count = 0
-            for d, m, dist in zip(documents, metadatas, distances):
-                if isinstance(d, str) and isinstance(m, dict):
-                    if dist <= min_dist:
-                        out.append({'text': d, 'metadata': m, 'score': None, 'distance': dist})
-                    else:
-                        filtered_count += 1
-            
-            if filtered_count > 0:
-                logger.info(f"Filtered out {filtered_count} low-quality statute results (distance > {min_dist})")
-            
-            # BM25 union
-            try:
-                bm25_ids = self.bm25_statutes.top_ids(query, top_k=n_results) if getattr(self, 'bm25_statutes', None) else []
-                if bm25_ids:
-                    fetched = self.indexer.statutes.get(ids=bm25_ids)
-                    f_docs = fetched.get('documents', [])
-                    f_metas = fetched.get('metadatas', [])
-                    for fd, fm in zip(f_docs, f_metas):
-                        if isinstance(fd, str) and isinstance(fm, dict):
-                            out.append({'text': fd, 'metadata': fm, 'score': None, 'distance': None})
-            except Exception:
-                pass
-
-            if not out:
-                logger.warning(f"No statute results above relevance threshold {min_dist}")
-
-            return self._dedupe_results(out, self._statute_result_key)
+            out = self._finalize_results(query, docs, 'statutes', n_results)
+            if debug or self.retrieval_debug:
+                return {'results': out, 'trace': trace}
+            return out
         except Exception as e:
             logger.error(f"Error in retrieve_statutes: {str(e)}")
             return []
 
-    def retrieve_regulations(self, query: str, n_results: int = 20) -> list[dict]:
+    def retrieve_regulations(self, query: str, n_results: int = 20, debug: bool = False):
         try:
-            emb = self.embedder.embed_query(query)
-            if not emb or not isinstance(emb, list):
-                logger.error(f"Invalid embedding returned: {type(emb)}")
+            query_variants = self._expand_query_variants(query)
+            docs, trace = self._collect_candidates(
+                collection=self.indexer.regs,
+                query_variants=query_variants,
+                n_results=n_results,
+                bm25_index=self.bm25_regs,
+                source_kind='regs',
+            )
+
+            if not docs:
+                logger.warning(f"No regulation results above relevance threshold {Config.RETRIEVAL_MIN_DISTANCE}")
                 return []
-            
-            # embedding candidates
-            res = self.indexer.regs.query(query_embeddings=[emb], n_results=n_results)
-            out = []
-            documents = res.get('documents', [[]])[0] if res.get('documents') else []
-            metadatas = res.get('metadatas', [[]])[0] if res.get('metadatas') else []
-            distances = res.get('distances', [[]])[0] if res.get('distances') else []
 
-            # Filter by distance threshold
-            min_dist = Config.RETRIEVAL_MIN_DISTANCE
-            filtered_count = 0
-            for d, m, dist in zip(documents, metadatas, distances):
-                if isinstance(d, str) and isinstance(m, dict):
-                    if dist <= min_dist:
-                        out.append({'text': d, 'metadata': m, 'score': None, 'distance': dist})
-                    else:
-                        filtered_count += 1
-            
-            if filtered_count > 0:
-                logger.info(f"Filtered out {filtered_count} low-quality regulation results (distance > {min_dist})")
-            
-            # BM25 union
-            try:
-                bm25_ids = self.bm25_regs.top_ids(query, top_k=n_results) if getattr(self, 'bm25_regs', None) else []
-                if bm25_ids:
-                    fetched = self.indexer.regs.get(ids=bm25_ids)
-                    f_docs = fetched.get('documents', [])
-                    f_metas = fetched.get('metadatas', [])
-                    for fd, fm in zip(f_docs, f_metas):
-                        if isinstance(fd, str) and isinstance(fm, dict):
-                            out.append({'text': fd, 'metadata': fm, 'score': None, 'distance': None})
-            except Exception:
-                pass
-
-            if not out:
-                logger.warning(f"No regulation results above relevance threshold {min_dist}")
-
-            return self._dedupe_results(out, self._regulation_result_key)
+            out = self._finalize_results(query, docs, 'regs', n_results)
+            if debug or self.retrieval_debug:
+                return {'results': out, 'trace': trace}
+            return out
         except Exception as e:
             logger.error(f"Error in retrieve_regulations: {str(e)}")
             return []
@@ -314,6 +450,21 @@ class Retriever:
 
     def _expand_query_variants(self, query: str) -> list[str]:
         normalized = self._normalize_query(query)
+        # guard: if expansion disabled or query looks like a citation/case name, avoid expansions
+        if not Config.ENABLE_QUERY_EXPANSION:
+            return [normalized] if normalized else []
+        # treat queries that look like citations or structured refs as ineligible for expansion
+        citation_like = False
+        if any(tok in normalized for tok in ('usc', 'cfr', 'section', '§')):
+            citation_like = True
+        if ' v ' in f' {normalized} ' or 'v.' in normalized or ' vs ' in f' {normalized} ':
+            citation_like = citation_like or True
+        # numeric-heavy queries (likely statute/regulation refs)
+        import re
+        if re.search(r"\b\d{1,3}\b", normalized) and re.search(r"(usc|cfr|section|title|part)", normalized):
+            citation_like = True
+        if citation_like:
+            return [normalized] if normalized else []
         variants: list[str] = []
         seen: set[str] = set()
 
@@ -357,11 +508,64 @@ class Retriever:
         return ' '.join((value or '').replace('§', 'section').split()).strip().lower()
 
     def _collect_candidates(self, collection, query_variants: list[str], n_results: int,
-                            where: dict | None = None, bm25_index: BM25Index | None = None) -> list[dict]:
-        docs: list[dict] = []
+                            where: dict | None = None, bm25_index: BM25Index | None = None,
+                            source_kind: str = 'statutes') -> tuple[list[dict], dict]:
+        candidate_map: dict = {}
         min_dist = Config.RETRIEVAL_MIN_DISTANCE
         filtered_count = 0
         expansion_limit = max(5, n_results // 2)
+        key_fn = self._case_result_key if source_kind == 'cases' else self._statute_result_key if source_kind == 'statutes' else self._regulation_result_key
+        trace = {
+            'query_variants': list(query_variants),
+            'filtered_by_distance': 0,
+            'bm25_hits': 0,
+            'title_hits': 0,
+            'candidate_count': 0,
+        }
+
+        def ensure_candidate(key, text='', metadata=None):
+            candidate = candidate_map.get(key)
+            if candidate is None:
+                candidate = {
+                    'text': text,
+                    'metadata': metadata or {},
+                    'distance': None,
+                    'semantic_score': 0.0,
+                    'bm25_score': 0.0,
+                    'title_score': 0.0,
+                    'source_id': None,
+                    'provenance': {},
+                    'source_kind': source_kind,
+                }
+                candidate_map[key] = candidate
+            else:
+                if text and not candidate.get('text'):
+                    candidate['text'] = text
+                if metadata and not candidate.get('metadata'):
+                    candidate['metadata'] = metadata
+            # populate a lightweight source identifier and provenance when available
+            try:
+                meta = metadata or {}
+                if isinstance(meta, dict):
+                    if not candidate.get('source_id'):
+                        # prefer parent_opinion_id for cases, else try known id fields
+                        candidate['source_id'] = meta.get('parent_opinion_id') or meta.get('ref_id') or meta.get('id') or meta.get('usc_citation') or meta.get('cfr_citation')
+                    if not candidate.get('provenance'):
+                        prov = {}
+                        if meta.get('bluebook_cite'):
+                            prov['cite'] = meta.get('bluebook_cite')
+                        if meta.get('case_name'):
+                            prov.setdefault('case_name', meta.get('case_name'))
+                        if meta.get('usc_citation'):
+                            prov.setdefault('usc', meta.get('usc_citation'))
+                        if meta.get('cfr_citation'):
+                            prov.setdefault('cfr', meta.get('cfr_citation'))
+                        if meta.get('date_filed'):
+                            prov.setdefault('date_filed', meta.get('date_filed'))
+                        candidate['provenance'] = prov
+            except Exception:
+                pass
+            return candidate
 
         for variant_index, variant in enumerate(query_variants):
             limit = n_results if variant_index == 0 else expansion_limit
@@ -385,7 +589,12 @@ class Retriever:
             for d, m, dist in zip(documents, metadatas, distances):
                 if isinstance(d, str) and isinstance(m, dict):
                     if dist <= min_dist:
-                        docs.append({'text': d, 'metadata': m, 'distance': dist, 'id': None})
+                        key = key_fn({'text': d, 'metadata': m})
+                        candidate = ensure_candidate(key, d, m)
+                        semantic_score = self._distance_to_similarity(dist)
+                        candidate['semantic_score'] = max(candidate.get('semantic_score', 0.0), semantic_score)
+                        candidate['distance'] = dist if candidate.get('distance') is None else min(candidate['distance'], dist)
+                        trace['candidate_count'] = trace.get('candidate_count', 0) + 1
                     else:
                         filtered_count += 1
 
@@ -393,30 +602,127 @@ class Retriever:
             logger.info(f"Filtered out {filtered_count} low-quality results (distance > {min_dist})")
 
         if bm25_index:
-            bm25_ids: list[str] = []
-            seen_ids: set[str] = set()
+            bm25_scores_by_id: dict[str, float] = {}
             for variant in query_variants:
                 try:
-                    top_ids = bm25_index.top_ids(variant, top_k=expansion_limit)
+                    top_pairs = bm25_index.query(variant, top_k=expansion_limit)
                 except Exception:
-                    top_ids = []
-                for candidate_id in top_ids:
-                    if candidate_id in seen_ids:
+                    top_pairs = []
+                if not top_pairs:
+                    continue
+                top_score = max((score for _, score in top_pairs), default=0.0)
+                for candidate_id, raw_score in top_pairs:
+                    norm_score = self._normalize_bm25_score(raw_score, top_score)
+                    if norm_score <= 0:
                         continue
-                    seen_ids.add(candidate_id)
-                    bm25_ids.append(candidate_id)
+                    bm25_scores_by_id[candidate_id] = max(bm25_scores_by_id.get(candidate_id, 0.0), norm_score)
+                trace['bm25_hits'] = trace.get('bm25_hits', 0) + len(top_pairs)
+
             try:
-                if bm25_ids:
-                    fetched = collection.get(ids=bm25_ids)
-                    f_docs = fetched.get('documents', [])
-                    f_metas = fetched.get('metadatas', [])
-                    for fd, fm in zip(f_docs, f_metas):
+                if bm25_scores_by_id:
+                    fetched = collection.get(ids=list(bm25_scores_by_id.keys()))
+                    f_docs = fetched.get('documents', []) or []
+                    f_metas = fetched.get('metadatas', []) or []
+                    f_ids = fetched.get('ids', []) or list(bm25_scores_by_id.keys())
+                    for candidate_id, fd, fm in zip(f_ids, f_docs, f_metas):
                         if isinstance(fd, str) and isinstance(fm, dict):
-                            docs.append({'text': fd, 'metadata': fm, 'distance': None, 'id': None})
+                            key = key_fn({'text': fd, 'metadata': fm})
+                            candidate = ensure_candidate(key, fd, fm)
+                            candidate['bm25_score'] = max(candidate.get('bm25_score', 0.0), bm25_scores_by_id.get(candidate_id, 0.0))
+                            trace['candidate_count'] = trace.get('candidate_count', 0) + 1
             except Exception:
                 pass
 
-        return docs
+        if getattr(self, 'bm25_titles', None) and getattr(self.indexer, 'titles', None):
+            title_scores_by_id: dict[str, float] = {}
+            for variant in query_variants:
+                try:
+                    top_pairs = self.bm25_titles.query(variant, top_k=expansion_limit)
+                except Exception:
+                    top_pairs = []
+                if not top_pairs:
+                    continue
+                top_score = max((score for _, score in top_pairs), default=0.0)
+                for title_id, raw_score in top_pairs:
+                    norm_score = self._normalize_bm25_score(raw_score, top_score)
+                    if norm_score <= 0:
+                        continue
+                    title_scores_by_id[title_id] = max(title_scores_by_id.get(title_id, 0.0), norm_score)
+                trace['title_hits'] = trace.get('title_hits', 0) + len(top_pairs)
+
+            try:
+                if title_scores_by_id:
+                    title_payload = self.indexer.titles.get(ids=list(title_scores_by_id.keys()))
+                    title_docs = title_payload.get('documents', []) or []
+                    title_metas = title_payload.get('metadatas', []) or []
+                    title_ids = title_payload.get('ids', []) or list(title_scores_by_id.keys())
+
+                    case_title_boosts: dict = {}
+                    source_ref_ids: dict[str, dict[str, float]] = {'statute': {}, 'regulation': {}}
+
+                    for title_id, title_text, title_meta in zip(title_ids, title_docs, title_metas):
+                        if not isinstance(title_meta, dict):
+                            continue
+                        source = title_meta.get('source')
+                        if source == 'case':
+                            parent_id = title_meta.get('parent_opinion_id')
+                            if parent_id:
+                                case_title_boosts[parent_id] = max(case_title_boosts.get(parent_id, 0.0), title_scores_by_id.get(title_id, 0.0))
+                        elif source in {'statute', 'regulation'}:
+                            ref_id = title_meta.get('ref_id')
+                            if ref_id:
+                                source_ref_ids[source][ref_id] = max(source_ref_ids[source].get(ref_id, 0.0), title_scores_by_id.get(title_id, 0.0))
+
+                    if source_kind == 'cases' and case_title_boosts:
+                        try:
+                            for parent_id, title_score in case_title_boosts.items():
+                                fetched = collection.get(where={'parent_opinion_id': {'$eq': parent_id}})
+                                docs = fetched.get('documents', []) or []
+                                metas = fetched.get('metadatas', []) or []
+                                for fd, fm in zip(docs, metas):
+                                    if isinstance(fd, str) and isinstance(fm, dict):
+                                        key = key_fn({'text': fd, 'metadata': fm})
+                                        candidate = ensure_candidate(key, fd, fm)
+                                        candidate['title_score'] = max(candidate.get('title_score', 0.0), title_score)
+                                        trace['candidate_count'] = trace.get('candidate_count', 0) + 1
+                        except Exception:
+                            pass
+
+                    for source, ref_map in source_ref_ids.items():
+                        if not ref_map:
+                            continue
+                        try:
+                            fetched = collection.get(ids=list(ref_map.keys()))
+                            docs = fetched.get('documents', []) or []
+                            metas = fetched.get('metadatas', []) or []
+                            ids = fetched.get('ids', []) or list(ref_map.keys())
+                            for ref_id, fd, fm in zip(ids, docs, metas):
+                                if isinstance(fd, str) and isinstance(fm, dict):
+                                    key = key_fn({'text': fd, 'metadata': fm})
+                                    candidate = ensure_candidate(key, fd, fm)
+                                    candidate['title_score'] = max(candidate.get('title_score', 0.0), ref_map.get(ref_id, 0.0))
+                                    trace['candidate_count'] = trace.get('candidate_count', 0) + 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        fused: list[dict] = []
+        for candidate in candidate_map.values():
+            hybrid_score = self._combine_scores(
+                source_kind=source_kind,
+                query=query_variants[0] if query_variants else '',
+                semantic_score=candidate.get('semantic_score', 0.0),
+                bm25_score=candidate.get('bm25_score', 0.0),
+                title_score=candidate.get('title_score', 0.0),
+            )
+            candidate['hybrid_score'] = hybrid_score
+            fused.append(candidate)
+
+        trace['final_candidate_count'] = len(fused)
+        trace['filtered_by_distance'] = filtered_count
+
+        return fused, trace
 
 if __name__ == '__main__':
     r = Retriever()

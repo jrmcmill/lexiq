@@ -33,6 +33,22 @@ class Indexer:
             except Exception:
                 return self.client.create_collection(name)
 
+    def _upsert_in_batches(self, collection, ids, documents, metadatas, embeddings=None, batch_size=256, desc="Upserting"):
+        from tqdm import tqdm as _tqdm
+
+        for i in _tqdm(range(0, len(ids), batch_size), desc=desc, unit="batch"):
+            batch_ids = ids[i:i + batch_size]
+            batch_docs = documents[i:i + batch_size]
+            batch_metas = metadatas[i:i + batch_size]
+            batch_embeddings = None if embeddings is None else embeddings[i:i + batch_size]
+            try:
+                if batch_embeddings is None:
+                    collection.upsert(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
+                else:
+                    collection.upsert(ids=batch_ids, documents=batch_docs, metadatas=batch_metas, embeddings=batch_embeddings)
+            except Exception as e:
+                logger.warning(f"Batch upsert failed for {desc.lower()}: {e}")
+
     def index_cases(self, df):
         if df.empty:
             logger.info("No case data to index")
@@ -114,7 +130,7 @@ class Indexer:
                     title_texts.append(name)
                     title_metas.append({'parent_opinion_id': pid, 'case_name': name, 'source': 'case'})
             if title_ids:
-                self.titles.upsert(ids=title_ids, documents=title_texts, metadatas=title_metas)
+                self._upsert_in_batches(self.titles, title_ids, title_texts, title_metas, batch_size=256, desc="Upserting Case Titles")
                 try:
                     self.bm25_titles.build(title_ids, title_texts)
                 except Exception:
@@ -191,12 +207,9 @@ class Indexer:
                     title_texts.append(heading)
                     title_metas.append({'source': 'statute', 'ref_id': _id})
             if title_ids:
-                self.titles.upsert(ids=title_ids, documents=title_texts, metadatas=title_metas)
+                self._upsert_in_batches(self.titles, title_ids, title_texts, title_metas, batch_size=256, desc="Upserting Statute Titles")
                 try:
-                    res = self.titles.get()
-                    docs = res.get('documents', [])
-                    ids_all = res.get('ids', [])
-                    self.bm25_titles.build(ids_all, docs)
+                    self.bm25_titles.build(title_ids, title_texts)
                 except Exception:
                     pass
         except Exception as e:
@@ -261,16 +274,51 @@ class Indexer:
                     title_texts.append(heading)
                     title_metas.append({'source': 'regulation', 'ref_id': _id})
             if title_ids:
-                self.titles.upsert(ids=title_ids, documents=title_texts, metadatas=title_metas)
+                self._upsert_in_batches(self.titles, title_ids, title_texts, title_metas, batch_size=256, desc="Upserting Regulation Titles")
                 try:
-                    res = self.titles.get()
-                    docs = res.get('documents', [])
-                    ids_all = res.get('ids', [])
-                    self.bm25_titles.build(ids_all, docs)
+                    self.bm25_titles.build(title_ids, title_texts)
                 except Exception:
                     pass
         except Exception as e:
             logger.warning(f"Could not index regulation titles: {e}")
+
+    def index_statute_titles(self, df):
+        if df.empty:
+            logger.info("No statute data to title-index")
+            return 0
+
+        title_ids = []
+        title_texts = []
+        title_metas = []
+        for _, row in tqdm(df.iterrows(), desc="Indexing Statute Titles", total=len(df), unit="doc"):
+            gid = None
+            try:
+                gid = row.get('granule_id') or row.get('package_id')
+            except Exception:
+                gid = None
+            if gid and str(gid).strip().lower() != 'nan':
+                chunk_id = f"stat_{row.title_number}_{row.section_number}_{gid}_{row.chunk_index}"
+            else:
+                chunk_id = f"stat_{row.title_number}_{row.section_number}_{row.chunk_index}"
+
+            heading = row.get('section_heading') if hasattr(row, 'get') else None
+            if heading and str(heading).strip() and str(heading).strip().lower() != 'nan':
+                title_ids.append(f"title_stat_{chunk_id}")
+                title_texts.append(heading)
+                title_metas.append({'source': 'statute', 'ref_id': chunk_id})
+
+        if not title_ids:
+            logger.info("No statute titles to index")
+            return 0
+
+        self._upsert_in_batches(self.titles, title_ids, title_texts, title_metas, batch_size=256, desc="Upserting Statute Titles")
+        try:
+            self.bm25_titles.build(title_ids, title_texts)
+        except Exception as e:
+            logger.warning(f"Could not rebuild BM25 for statute titles: {e}")
+
+        logger.info(f"Indexed {len(title_ids)} statute titles")
+        return len(title_ids)
 
     def get_collection_stats(self):
         return {
