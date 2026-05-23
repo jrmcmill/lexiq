@@ -6,6 +6,7 @@ class AgentState(TypedDict):
     retrieved_cases: List[Dict[str, Any]]
     retrieved_statutes: List[Dict[str, Any]]
     retrieved_regs: List[Dict[str, Any]]
+    retrieved_textbooks: List[Dict[str, Any]]
     retrieved_session: List[Dict[str, Any]]
     final_answer: str
     citations: List[str]

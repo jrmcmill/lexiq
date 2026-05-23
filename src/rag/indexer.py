@@ -16,12 +16,14 @@ class Indexer:
         self.cases = self._get_collection(Config.CHROMA_CASES_COLLECTION)
         self.statutes = self._get_collection(Config.CHROMA_STATUTES_COLLECTION)
         self.regs = self._get_collection(Config.CHROMA_REGULATIONS_COLLECTION)
+        self.textbooks = self._get_collection(getattr(Config, 'CHROMA_TEXTBOOKS_COLLECTION', 'lexiq_textbooks'))
         self.titles = self._get_collection(Config.CHROMA_TITLES_COLLECTION)
         self.embedder = Embedder()
         # BM25 indexes persisted alongside Chroma DB
         self.bm25_cases = BM25Index(persist, "cases")
         self.bm25_statutes = BM25Index(persist, "statutes")
         self.bm25_regs = BM25Index(persist, "regs")
+        self.bm25_textbooks = BM25Index(persist, "textbooks")
         self.bm25_titles = BM25Index(persist, "titles")
 
     def _get_collection(self, name):
@@ -282,6 +284,72 @@ class Indexer:
         except Exception as e:
             logger.warning(f"Could not index regulation titles: {e}")
 
+    def index_textbooks(self, df):
+        if df.empty:
+            logger.info("No textbook data to index")
+            return
+
+        ids = []
+        texts = []
+        metadatas = []
+        for _, row in tqdm(df.iterrows(), desc="Indexing Textbooks", total=len(df), unit="doc"):
+            text = row.get('text')
+            if not text or not str(text).strip():
+                continue
+
+            textbook_id = row.get('textbook_id') or row.get('source_filename') or row.get('book_title') or 'textbook'
+            page_number = row.get('page_number')
+            chunk_index = row.get('chunk_index')
+            _id = f"textbook_{textbook_id}_{page_number}_{chunk_index}"
+            ids.append(_id)
+            texts.append(text)
+            metadatas.append({
+                'textbook_id': textbook_id,
+                'source_filename': row.get('source_filename'),
+                'book_title': row.get('book_title'),
+                'book_author': row.get('book_author'),
+                'book_subject': row.get('book_subject'),
+                'book_creator': row.get('book_creator'),
+                'book_producer': row.get('book_producer'),
+                'page_number': page_number,
+                'page_start': row.get('page_start'),
+                'page_end': row.get('page_end'),
+                'section_heading': row.get('section_heading'),
+                'chapter': row.get('chapter'),
+                'chunk_index': chunk_index,
+            })
+
+        if not ids:
+            logger.info("No textbook chunks to index")
+            return
+
+        batch_size = 256
+        all_ids = []
+        all_texts = []
+        from tqdm import tqdm as _tqdm
+        for i in _tqdm(range(0, len(ids), batch_size), desc="Embedding+Upserting Textbooks", unit="batch"):
+            batch_ids = ids[i:i+batch_size]
+            batch_texts = texts[i:i+batch_size]
+            batch_metas = metadatas[i:i+batch_size]
+            embeddings = self.embedder.embed(batch_texts)
+            try:
+                self.textbooks.upsert(ids=batch_ids, documents=batch_texts, metadatas=batch_metas, embeddings=embeddings)
+            except Exception as e:
+                logger.warning(f"Batch upsert failed for textbooks: {e}; retrying without embeddings")
+                try:
+                    self.textbooks.upsert(ids=batch_ids, documents=batch_texts, metadatas=batch_metas)
+                except Exception as e2:
+                    logger.error(f"Fallback batch upsert also failed for textbooks: {e2}")
+            all_ids.extend(batch_ids)
+            all_texts.extend(batch_texts)
+
+        logger.info(f"Indexed {len(all_ids)} textbook chunks (batched)")
+        try:
+            self.bm25_textbooks.build(all_ids, all_texts)
+            logger.info("Built BM25 index for textbooks")
+        except Exception as e:
+            logger.warning(f"Could not build BM25 for textbooks: {e}")
+
     def index_statute_titles(self, df):
         if df.empty:
             logger.info("No statute data to title-index")
@@ -325,6 +393,7 @@ class Indexer:
             'cases': getattr(self.cases, 'count', lambda: 0)(),
             'statutes': getattr(self.statutes, 'count', lambda: 0)(),
             'regulations': getattr(self.regs, 'count', lambda: 0)(),
+            'textbooks': getattr(self.textbooks, 'count', lambda: 0)(),
         }
 
     def get_entity_counts(self):
@@ -337,6 +406,10 @@ class Indexer:
             'regulations': self._count_unique_entities(
                 self.regs,
                 lambda meta: (meta.get('cfr_title'), meta.get('cfr_part'), meta.get('cfr_section')),
+            ),
+            'textbooks': self._count_unique_entities(
+                self.textbooks,
+                lambda meta: (meta.get('textbook_id') or meta.get('source_filename') or meta.get('book_title')),
             ),
         }
 
@@ -418,6 +491,16 @@ if __name__ == '__main__':
             logger.warning(f"Could not index regulations: {e}")
     else:
         logger.info("No regulations.parquet found")
+
+    textbooks_file = os.path.join(processed_dir, "textbooks.parquet")
+    if os.path.exists(textbooks_file):
+        try:
+            df_textbooks = pd.read_parquet(textbooks_file)
+            idx.index_textbooks(df_textbooks)
+        except Exception as e:
+            logger.warning(f"Could not index textbooks: {e}")
+    else:
+        logger.info("No textbooks.parquet found")
     
     stats = idx.get_collection_stats()
     print(f"Index stats: {stats}")

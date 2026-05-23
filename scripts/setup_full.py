@@ -84,12 +84,14 @@ def preprocess_and_index():
     cases = pre.clean_opinions()
     statutes = pre.clean_statutes()
     regs = pre.clean_regulations()
+    textbooks = pre.clean_textbooks()
 
     print("Indexing into ChromaDB...")
     idx = Indexer()
     idx.index_cases(cases)
     idx.index_statutes(statutes)
     idx.index_regulations(regs)
+    idx.index_textbooks(textbooks)
 
     print("Building citation graph...")
     graph_stats = build_citation_graph(
@@ -113,6 +115,7 @@ def main():
     parser.add_argument('--granules', type=int, default=500, help='Number of US Code granules to fetch')
     parser.add_argument('--granule-pages', type=int, default=200, help='Max pages for US Code fetch')
     parser.add_argument('--ecfr-titles', type=int, default=10, help='Number of eCFR titles to fetch (newest first)')
+    parser.add_argument('--skip-fetch', action='store_true', help='Skip external fetches and only preprocess/index existing raw files')
     parser.add_argument('--no-reindex', dest='reindex', action='store_false', help='Skip preprocessing and reindex step')
     parser.add_argument('--embed-model', type=str, default=None, help='Override embed model with env var EMBED_MODEL')
     args = parser.parse_args()
@@ -126,13 +129,16 @@ def main():
     total_steps = 4 if args.reindex else 3
     steps = tqdm(total=total_steps, desc='LexIQ setup', unit='step')
 
-    # fetch
-    fetch_courtlistener(target_cases=args.cases, max_pages=args.case_pages)
-    steps.update(1)
-    fetch_uscode(target_granules=args.granules, max_pages=args.granule_pages)
-    steps.update(1)
-    fetch_ecfr(titles_to_check=args.ecfr_titles)
-    steps.update(1)
+    if not args.skip_fetch:
+        # fetch
+        fetch_courtlistener(target_cases=args.cases, max_pages=args.case_pages)
+        steps.update(1)
+        fetch_uscode(target_granules=args.granules, max_pages=args.granule_pages)
+        steps.update(1)
+        fetch_ecfr(titles_to_check=args.ecfr_titles)
+        steps.update(1)
+    else:
+        steps.update(3)
 
     # preprocess + index
     if args.reindex:

@@ -28,6 +28,7 @@ def _rebuild_pipeline(progress_callback=None):
 	cases_df = pre.clean_opinions()
 	statutes_df = pre.clean_statutes()
 	regs_df = pre.clean_regulations()
+	textbooks_df = pre.clean_textbooks()
 
 	if progress_callback:
 		progress_callback(0.82, "Indexing: updating vector collections for all sources")
@@ -35,12 +36,14 @@ def _rebuild_pipeline(progress_callback=None):
 	idx.index_cases(cases_df)
 	idx.index_statutes(statutes_df)
 	idx.index_regulations(regs_df)
+	idx.index_textbooks(textbooks_df)
 
 	stats = idx.get_collection_stats()
 	processed = {
 		"cases_chunks": len(cases_df),
 		"statutes_chunks": len(statutes_df),
 		"regulations_chunks": len(regs_df),
+		"textbook_chunks": len(textbooks_df),
 	}
 	return {"processed": processed, "index_stats": stats}
 

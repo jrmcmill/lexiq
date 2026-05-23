@@ -14,7 +14,7 @@ def test_route_query_fallback_on_parse_failure(monkeypatch):
     monkeypatch.setattr(nd, '_call_ollama', lambda p: 'not a json')
     st = {'messages': [], 'query': 'q', 'retrieved_cases': [], 'retrieved_statutes': [], 'retrieved_regs': [], 'retrieved_session': [], 'final_answer':'', 'citations':[], 'tool_calls':[], 'session_id':'s', 'court_filter':None, 'date_after':None, 'date_before':None, 'error':None}
     st2 = route_query(st)
-    assert set(st2['tool_calls']) == set(['case_law','statute','regulation','session'])
+    assert set(st2['tool_calls']) == set(['case_law','statute','regulation','textbook','session'])
 
 def test_generate_answer_builds_prompt(monkeypatch):
     # patch _call_ollama to return a canned response
@@ -51,6 +51,48 @@ def test_generate_answer_builds_prompt(monkeypatch):
     assert 'CASE SOURCES' in captured['prompt']
     # Ensure the case-focused context appears before the question block
     assert captured['prompt'].index('CASE HIGHLIGHTS (read these first):') < captured['prompt'].index('QUESTION:')
+
+
+def test_generate_answer_includes_authority_labels_in_prompt(monkeypatch):
+    from src.agent import nodes as nd
+    captured = {}
+
+    def fake_call(prompt):
+        captured['prompt'] = prompt
+        return 'Answer. 600 U.S. 1'
+
+    monkeypatch.setattr(nd, '_call_ollama', fake_call)
+    st = {
+        'messages': [],
+        'query': 'q',
+        'retrieved_cases': [
+            {
+                'text': 'A Supreme Court case directly controls the issue.',
+                'metadata': {'bluebook_cite': '600 U.S. 1', 'parent_opinion_id': 1, 'case_name': 'Supreme Court Case', 'court': 'Supreme Court of the United States'},
+                'distance': 0.1,
+                'score': 0.95,
+                'authority_score': 0.98,
+                'authority_tier': 'high',
+                'authority_notes': 'supreme court authority; citation metadata present',
+            }
+        ],
+        'retrieved_statutes': [],
+        'retrieved_regs': [],
+        'retrieved_session': [],
+        'final_answer': '',
+        'citations': [],
+        'tool_calls': ['case_law'],
+        'session_id': 's',
+        'court_filter': None,
+        'date_after': None,
+        'date_before': None,
+        'error': None,
+    }
+
+    st2 = generate_answer(st)
+    assert st2['final_answer']
+    assert 'AUTHORITY: HIGH' in captured['prompt']
+    assert 'AUTHORITY NOTES:' in captured['prompt']
 
 
 def test_generate_answer_dedupes_duplicate_chunks_before_prompt(monkeypatch):
@@ -190,6 +232,52 @@ def test_generate_answer_allows_non_case_primary_sources(monkeypatch):
     assert 'Case Law required: no' in captured['prompt']
     assert 'CASE HIGHLIGHTS (read these first):' not in captured['prompt']
     assert st2['final_answer']
+
+
+def test_generate_answer_includes_textbook_sources_in_prompt(monkeypatch):
+    from src.agent import nodes as nd
+    captured = {}
+
+    def fake_call(prompt):
+        captured['prompt'] = prompt
+        return 'The textbook explains the doctrine. Citations: '
+
+    monkeypatch.setattr(nd, '_call_ollama', fake_call)
+    st = {
+        'messages': [],
+        'query': 'what is negligence in tort law?',
+        'retrieved_cases': [],
+        'retrieved_statutes': [],
+        'retrieved_regs': [],
+        'retrieved_textbooks': [
+            {
+                'text': 'Negligence is the failure to exercise reasonable care under the circumstances.',
+                'metadata': {
+                    'book_title': 'Everything You Need To Know About American Law',
+                    'source_filename': 'law_101.pdf',
+                    'section_heading': 'Negligence',
+                    'chapter': 'Torts',
+                    'page_number': 42,
+                },
+                'distance': 0.12,
+                'score': 0.96,
+            }
+        ],
+        'retrieved_session': [],
+        'final_answer': '',
+        'citations': [],
+        'tool_calls': ['textbook'],
+        'session_id': 's',
+        'court_filter': None,
+        'date_after': None,
+        'date_before': None,
+        'error': None,
+    }
+
+    st2 = generate_answer(st)
+    assert st2['final_answer']
+    assert 'SOURCE: Textbook' in captured['prompt']
+    assert 'Everything You Need To Know About American Law' in captured['prompt']
 
 
 def test_retrieve_node_retries_low_confidence_sources_and_sets_warning(monkeypatch):

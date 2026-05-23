@@ -21,6 +21,7 @@ def run_query(query: str, session_id: str, history: list[dict], court_filter: st
         'retrieved_cases': [],
         'retrieved_statutes': [],
         'retrieved_regs': [],
+        'retrieved_textbooks': [],
         'retrieved_session': [],
         'final_answer': '',
         'citations': [],

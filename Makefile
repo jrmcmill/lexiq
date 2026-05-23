@@ -18,6 +18,10 @@ setup-citation-graph:
 	# Rebuild only the citation graph from existing raw and processed data
 	.venv/bin/python scripts/setup_citation_graph.py
 
+setup-textbooks:
+	# Process local textbook PDFs and index them into the shared corpus
+	.venv/bin/python scripts/setup_textbooks.py
+
 app:
 	.venv/bin/streamlit run streamlit_app.py
 

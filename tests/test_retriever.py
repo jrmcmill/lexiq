@@ -11,6 +11,7 @@ class DummyIndexer:
         self.cases = DummyCollection()
         self.statutes = DummyCollection()
         self.regs = DummyCollection()
+        self.textbooks = DummyCollection()
         self.titles = None
 
 @pytest.fixture
@@ -21,11 +22,13 @@ def retriever(monkeypatch):
     r.indexer.cases = DummyCollection()
     r.indexer.statutes = DummyCollection()
     r.indexer.regs = DummyCollection()
+    r.indexer.textbooks = DummyCollection()
     r.indexer.titles = None
     r.indexer.client = MagicMock()
     r.bm25_cases = MagicMock(query=lambda q, top_k: [])
     r.bm25_statutes = MagicMock(query=lambda q, top_k: [])
     r.bm25_regs = MagicMock(query=lambda q, top_k: [])
+    r.bm25_textbooks = MagicMock(query=lambda q, top_k: [])
     r.bm25_titles = None
     return r
 
@@ -56,6 +59,46 @@ def test_finalize_results_blends_hybrid_and_rerank(monkeypatch, retriever):
     assert res[0]['score'] >= res[1]['score']
     assert 'hybrid_score' in res[0]
     assert 'rerank_score' in res[0]
+
+
+def test_finalize_results_prefers_higher_authority_case(monkeypatch, retriever):
+    candidates = [
+        {
+            'text': 'lower authority but strong topical match',
+            'metadata': {
+                'bluebook_cite': '111 F. Supp. 2d 1',
+                'case_name': 'Lower Court Case',
+                'parent_opinion_id': 11,
+                'court': 'District Court',
+            },
+            'hybrid_score': 0.95,
+            'distance': 0.1,
+            'semantic_score': 0.95,
+            'bm25_score': 0.9,
+            'title_score': 0.1,
+        },
+        {
+            'text': 'higher authority with slightly weaker topical match',
+            'metadata': {
+                'bluebook_cite': '600 U.S. 1',
+                'case_name': 'Supreme Court Case',
+                'parent_opinion_id': 12,
+                'court': 'Supreme Court of the United States',
+            },
+            'hybrid_score': 0.85,
+            'distance': 0.1,
+            'semantic_score': 0.85,
+            'bm25_score': 0.8,
+            'title_score': 0.1,
+        },
+    ]
+    monkeypatch.setattr(retriever, 'reranker', MagicMock(rerank=lambda q, r, top_k=None: [dict(r[0], rerank_score=0.92), dict(r[1], rerank_score=0.92)]))
+
+    res = retriever._finalize_results('query', candidates, 'cases', 2)
+
+    assert res[0]['metadata']['bluebook_cite'] == '600 U.S. 1'
+    assert res[0]['authority_tier'] == 'high'
+    assert res[0]['authority_score'] > res[1]['authority_score']
 
 
 def test_expand_query_variants():

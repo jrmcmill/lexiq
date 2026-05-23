@@ -18,6 +18,7 @@ class Config:
     CHROMA_CASES_COLLECTION: str = os.getenv("CHROMA_CASES_COLLECTION", "lexiq_cases")
     CHROMA_STATUTES_COLLECTION: str = os.getenv("CHROMA_STATUTES_COLLECTION", "lexiq_statutes")
     CHROMA_REGULATIONS_COLLECTION: str = os.getenv("CHROMA_REGULATIONS_COLLECTION", "lexiq_regulations")
+    CHROMA_TEXTBOOKS_COLLECTION: str = os.getenv("CHROMA_TEXTBOOKS_COLLECTION", "lexiq_textbooks")
     CHROMA_TITLES_COLLECTION: str = os.getenv("CHROMA_TITLES_COLLECTION", "lexiq_titles")
     CITATION_GRAPH_FILENAME: str = os.getenv("CITATION_GRAPH_FILENAME", "citation_graph.json")
     EMBED_MODEL: str = os.getenv("EMBED_MODEL", "BAAI/bge-large-en-v1.5")
@@ -60,6 +61,7 @@ class Config:
     RETRIEVAL_CONFIDENCE_THRESHOLD_CASES: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_CASES", "0.40"))
     RETRIEVAL_CONFIDENCE_THRESHOLD_STATUTES: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_STATUTES", "0.40"))
     RETRIEVAL_CONFIDENCE_THRESHOLD_REGULATIONS: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_REGULATIONS", "0.40"))
+    RETRIEVAL_CONFIDENCE_THRESHOLD_TEXTBOOKS: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_TEXTBOOKS", "0.40"))
     RETRIEVAL_CONFIDENCE_THRESHOLD_SESSION: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_SESSION", "0.40"))
     RETRIEVAL_CONFIDENCE_REWRITE_ENABLED: bool = os.getenv("RETRIEVAL_CONFIDENCE_REWRITE_ENABLED", "true").lower() == "true"
     # Minimum recommended length for LLM answers (words). Used to nudge output verbosity.

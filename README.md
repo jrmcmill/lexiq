@@ -1,12 +1,12 @@
 # LexIQ
 
-LexIQ is a local-first legal research assistant for case law, statutes, and regulations.
+LexIQ is a local-first legal research assistant for case law, statutes, regulations, and textbooks.
 It runs against a local Ollama model, stores sources in ChromaDB, and exposes the system
 through a Streamlit app with search, chat, document, and evaluation workflows.
 
 ## What it does
 
-- Searches and answers questions over federal case law, U.S. Code, CFR, and uploaded documents.
+- Searches and answers questions over federal case law, U.S. Code, CFR, textbooks, and uploaded documents.
 - Prioritizes case sources in the answer prompt when case law is available.
 - Uses retrieval expansion, reranking, citation graph expansion, and source trimming to reduce noisy context.
 - Shows which sources were retrieved versus actually used in the prompt.
@@ -18,11 +18,11 @@ through a Streamlit app with search, chat, document, and evaluation workflows.
 flowchart TD
   User --> Chat[Streamlit UI]
   Chat --> Agent[Query routing + answer generation]
-  Agent --> Retriever[Case / statute / regulation retrieval]
+  Agent --> Retriever[Case / statute / regulation / textbook retrieval]
   Retriever --> Chroma[Persistent ChromaDB collections]
   Retriever --> Graph[Citation graph]
   Agent --> Ollama[Local LLM via Ollama]
-  Data[CourtListener / GovInfo / eCFR / uploads] --> Ingest[Fetch + preprocess + index]
+  Data[CourtListener / GovInfo / eCFR / textbooks / uploads] --> Ingest[Fetch + preprocess + index]
   Ingest --> Chroma
   Ingest --> Graph
 ```
@@ -80,6 +80,12 @@ If you already have the raw and processed data in place and only want to refresh
 
 ```bash
 make setup-citation-graph
+```
+
+To process only the local textbook PDFs and add them to the shared index, run:
+
+```bash
+make setup-textbooks
 ```
 
 ### 3. Start Ollama
@@ -176,7 +182,7 @@ LexIQ currently uses a few layers to keep responses closer to the sources:
 - Reranking to prefer stronger candidates.
 - Citation graph expansion for sources linked by citations or statutory/regulatory references.
 - Case grouping so one opinion does not swamp the prompt with duplicate chunks.
-- A smaller non-case prompt budget so statutes and regulations do not crowd out cases.
+- A smaller non-case prompt budget so statutes, regulations, and textbooks do not crowd out cases.
 - An LLM repair pass when the draft answer omits the retrieved case or cites unsupported authorities.
 
 This is designed to improve answer quality without forcing deterministic templates into the final output.
@@ -207,4 +213,3 @@ evaluation parsing, citation graph construction, and UI helper utilities.
 ## Legal note
 
 LexIQ is a research tool, not legal advice.
-or:

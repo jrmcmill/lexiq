@@ -29,6 +29,14 @@ def regulation_search(query: str, debug: bool = False, aggressive: bool = False)
         return {'results': [], 'trace': {}} if debug else []
 
 
+def textbook_search(query: str, debug: bool = False, aggressive: bool = False) -> list[dict] | dict:
+    try:
+        return retriever.retrieve_textbooks(query, debug=debug, aggressive=aggressive)
+    except Exception as e:
+        logger.error(str(e))
+        return {'results': [], 'trace': {}} if debug else []
+
+
 def session_document_search(query: str, session_id: str) -> list[dict]:
     try:
         return retriever.retrieve_session_docs(query, session_id)

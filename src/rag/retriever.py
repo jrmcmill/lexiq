@@ -41,11 +41,13 @@ class Retriever:
         self.bm25_cases = BM25Index(persist, "cases")
         self.bm25_statutes = BM25Index(persist, "statutes")
         self.bm25_regs = BM25Index(persist, "regs")
+        self.bm25_textbooks = BM25Index(persist, "textbooks")
         self.bm25_titles = BM25Index(persist, "titles")
         try:
             self.bm25_cases.load()
             self.bm25_statutes.load()
             self.bm25_regs.load()
+            self.bm25_textbooks.load()
             self.bm25_titles.load()
         except Exception:
             pass
@@ -77,6 +79,7 @@ class Retriever:
             'cases': {'semantic': 0.42, 'content': 0.23, 'title': 0.30, 'synergy': 0.05},
             'statutes': {'semantic': 0.50, 'content': 0.33, 'title': 0.12, 'synergy': 0.05},
             'regs': {'semantic': 0.50, 'content': 0.33, 'title': 0.12, 'synergy': 0.05},
+            'textbooks': {'semantic': 0.48, 'content': 0.34, 'title': 0.13, 'synergy': 0.05},
             'session': {'semantic': 0.85, 'content': 0.15, 'title': 0.0, 'synergy': 0.0},
         }
         weights = dict(base_weights.get(source_kind, base_weights['statutes']))
@@ -93,6 +96,10 @@ class Retriever:
             weights['title'] += 0.05
             weights['content'] += 0.02
             weights['semantic'] -= 0.07
+
+        if source_kind == 'textbooks':
+            weights['content'] += 0.05
+            weights['semantic'] -= 0.03
 
         total = sum(max(value, 0.0) for value in weights.values()) or 1.0
         return {key: max(value, 0.0) / total for key, value in weights.items()}
@@ -123,6 +130,8 @@ class Retriever:
             return (0.58, 0.42)
         if source_kind in {'statutes', 'regs'}:
             return (0.52, 0.48)
+        if source_kind == 'textbooks':
+            return (0.50, 0.50)
         return (0.50, 0.50)
 
     def _graph_blend_weight(self, source_kind: str) -> float:
@@ -130,7 +139,125 @@ class Retriever:
             return 0.10
         if source_kind in {'statutes', 'regs'}:
             return 0.08
+        if source_kind == 'textbooks':
+            return 0.03
         return 0.05
+
+    def _authority_weight(self, source_kind: str) -> float:
+        if source_kind == 'cases':
+            return 0.40
+        if source_kind in {'statutes', 'regs'}:
+            return 0.22
+        if source_kind == 'textbooks':
+            return 0.10
+        return 0.08
+
+    def _authority_profile(self, source_kind: str, metadata: dict | None) -> tuple[float, str, str]:
+        meta = metadata if isinstance(metadata, dict) else {}
+        source_kind = self._normalize_graph_source_kind(source_kind)
+
+        def _text(*keys: str) -> str:
+            parts = []
+            for key in keys:
+                value = meta.get(key)
+                if value:
+                    parts.append(str(value))
+            return ' '.join(parts).strip().lower()
+
+        if source_kind == 'cases':
+            court_text = _text('court', 'court_name', 'court_level', 'jurisdiction', 'court_type')
+            notes = []
+            if not court_text:
+                score = 0.55
+                tier = 'medium'
+                notes.append('court metadata missing')
+            elif any(token in court_text for token in ('supreme court', 'scotus', 'u.s. supreme court')):
+                score = 0.98
+                tier = 'high'
+                notes.append('supreme court authority')
+            elif any(token in court_text for token in ('court of appeals', 'court appeals', 'appellate', 'circuit')):
+                score = 0.88
+                tier = 'high'
+                notes.append('appellate authority')
+            elif any(token in court_text for token in ('district court', 'bankruptcy court')):
+                score = 0.70
+                tier = 'medium'
+                notes.append('trial-level federal authority')
+            elif any(token in court_text for token in ('state supreme', 'state high court')):
+                score = 0.92
+                tier = 'high'
+                notes.append('state high-court authority')
+            elif any(token in court_text for token in ('superior court', 'trial court', 'circuit court', 'county court', 'family court')):
+                score = 0.56
+                tier = 'low'
+                notes.append('trial-level state authority')
+            else:
+                score = 0.64
+                tier = 'medium'
+                notes.append('general court metadata present')
+
+            if meta.get('bluebook_cite') or meta.get('case_name'):
+                score = min(1.0, score + 0.05)
+                notes.append('citation metadata present')
+            else:
+                score = max(0.0, score - 0.05)
+                notes.append('citation metadata missing')
+
+            return score, tier, '; '.join(notes)
+
+        if source_kind == 'statutes':
+            has_citation = bool(meta.get('usc_citation'))
+            has_location = bool(meta.get('title_number') and meta.get('section_number'))
+            if has_citation or has_location:
+                score = 0.96
+                tier = 'high'
+                notes = ['codified statute citation present']
+            else:
+                score = 0.72
+                tier = 'medium'
+                notes = ['statute citation metadata incomplete']
+            if meta.get('section_title'):
+                score = min(1.0, score + 0.02)
+                notes.append('section title present')
+            return score, tier, '; '.join(notes)
+
+        if source_kind == 'regs':
+            has_citation = bool(meta.get('cfr_citation'))
+            has_location = bool(meta.get('cfr_title') and (meta.get('cfr_part') or meta.get('cfr_section')))
+            if has_citation or has_location:
+                score = 0.94
+                tier = 'high'
+                notes = ['regulation citation metadata present']
+            else:
+                score = 0.70
+                tier = 'medium'
+                notes = ['regulation citation metadata incomplete']
+            if meta.get('section_title'):
+                score = min(1.0, score + 0.02)
+                notes.append('section title present')
+            return score, tier, '; '.join(notes)
+
+        if source_kind == 'textbooks':
+            has_title = bool(meta.get('book_title') or meta.get('source_filename') or meta.get('textbook_id'))
+            has_location = bool(meta.get('chapter') or meta.get('section_heading') or meta.get('page_number'))
+            if has_title or has_location:
+                score = 0.62
+                tier = 'medium'
+                notes = ['textbook background source present']
+            else:
+                score = 0.45
+                tier = 'low'
+                notes = ['textbook metadata incomplete']
+            if meta.get('page_number'):
+                score = min(1.0, score + 0.03)
+                notes.append('page metadata present')
+            return score, tier, '; '.join(notes)
+
+        has_reference = bool(meta.get('citation') or meta.get('source_id') or meta.get('chunk_id'))
+        score = 0.72 if has_reference else 0.58
+        tier = 'medium' if has_reference else 'low'
+        notes = ['source identifier present' if has_reference else 'source identifier missing']
+        return score, tier, '; '.join(notes)
 
     def _source_collection(self, source_kind: str):
         normalized = self._normalize_graph_source_kind(source_kind)
@@ -138,6 +265,8 @@ class Retriever:
             return self.indexer.cases
         if normalized == 'statutes':
             return self.indexer.statutes
+        if normalized == 'textbooks':
+            return self.indexer.textbooks
         return self.indexer.regs
 
     def _normalize_graph_source_kind(self, source_kind: str) -> str:
@@ -148,6 +277,8 @@ class Retriever:
             return 'statutes'
         if normalized in {'reg', 'regs', 'regulation', 'regulations', 'cfr'}:
             return 'regs'
+        if normalized in {'textbook', 'textbooks', 'book', 'books', 'treatise'}:
+            return 'textbooks'
         return normalized
 
     def _source_confidence_threshold(self, source_kind: str) -> float:
@@ -155,6 +286,7 @@ class Retriever:
             'cases': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_CASES,
             'statutes': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_STATUTES,
             'regs': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_REGULATIONS,
+            'textbooks': getattr(Config, 'RETRIEVAL_CONFIDENCE_THRESHOLD_TEXTBOOKS', Config.RETRIEVAL_CONFIDENCE_THRESHOLD_DEFAULT),
             'session': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_SESSION,
         }
         return float(mapping.get(self._normalize_graph_source_kind(source_kind), Config.RETRIEVAL_CONFIDENCE_THRESHOLD_DEFAULT))
@@ -188,6 +320,7 @@ class Retriever:
         key = key_fn(item)
         candidate = candidate_map.get(key)
         if candidate is None:
+            authority_score, authority_tier, authority_notes = self._authority_profile(source_kind, item.get('metadata') or {})
             candidate = {
                 'text': item.get('text', ''),
                 'metadata': item.get('metadata', {}) or {},
@@ -196,6 +329,9 @@ class Retriever:
                 'bm25_score': item.get('bm25_score', 0.0),
                 'title_score': item.get('title_score', 0.0),
                 'graph_score': item.get('graph_score', 0.0),
+                'authority_score': authority_score,
+                'authority_tier': authority_tier,
+                'authority_notes': authority_notes,
                 'source_id': item.get('source_id'),
                 'provenance': item.get('provenance') or {},
                 'source_kind': source_kind,
@@ -215,6 +351,12 @@ class Retriever:
         candidate['bm25_score'] = max(candidate.get('bm25_score', 0.0), item.get('bm25_score', 0.0) or 0.0)
         candidate['title_score'] = max(candidate.get('title_score', 0.0), item.get('title_score', 0.0) or 0.0)
         candidate['graph_score'] = max(candidate.get('graph_score', 0.0), item.get('graph_score', 0.0) or 0.0)
+        authority_score, authority_tier, authority_notes = self._authority_profile(source_kind, item.get('metadata') or {})
+        candidate['authority_score'] = max(candidate.get('authority_score', 0.0), authority_score)
+        if authority_tier == 'high' or candidate.get('authority_tier') not in {'high', 'medium', 'low'}:
+            candidate['authority_tier'] = authority_tier
+        if authority_notes and not candidate.get('authority_notes'):
+            candidate['authority_notes'] = authority_notes
         if item.get('source_id') and not candidate.get('source_id'):
             candidate['source_id'] = item.get('source_id')
         if item.get('provenance') and not candidate.get('provenance'):
@@ -331,7 +473,16 @@ class Retriever:
             graph_score = max(0.0, min(1.0, self._safe_float(item.get('graph_score')) or 0.0))
             graph_weight = self._graph_blend_weight(source_kind)
             base_weight = max(0.0, 1.0 - graph_weight)
-            final_score = base_weight * ((hybrid_weight * hybrid_score) + (rerank_weight * rerank_norm)) + (graph_weight * graph_score)
+            evidence_score = base_weight * ((hybrid_weight * hybrid_score) + (rerank_weight * rerank_norm)) + (graph_weight * graph_score)
+            authority_score = self._safe_float(item.get('authority_score'))
+            if authority_score is None:
+                authority_score, authority_tier, authority_notes = self._authority_profile(source_kind, item.get('metadata') or {})
+                item['authority_score'] = authority_score
+                item['authority_tier'] = authority_tier
+                item['authority_notes'] = authority_notes
+            authority_score = max(0.0, min(1.0, authority_score or 0.0))
+            authority_weight = self._authority_weight(source_kind)
+            final_score = ((1.0 - authority_weight) * evidence_score) + (authority_weight * authority_score)
             # compute contribution breakdown for transparency
             try:
                 weights = self._source_weights(source_kind, query)
@@ -355,6 +506,7 @@ class Retriever:
                 'synergy': round(synergy_val, 6),
                 'rerank': round(rerank_norm * rerank_weight, 6),
                 'graph': round(graph_weight * graph_score, 6),
+                'authority': round(authority_weight * authority_score, 6),
             }
 
             scored_results.append({
@@ -367,6 +519,9 @@ class Retriever:
                 'semantic_score': item.get('semantic_score'),
                 'bm25_score': item.get('bm25_score'),
                 'title_score': item.get('title_score'),
+                'authority_score': authority_score,
+                'authority_tier': item.get('authority_tier', 'medium' if authority_score >= 0.7 else 'low'),
+                'authority_notes': item.get('authority_notes', ''),
                 'contributions': contributions,
                 'source_id': item.get('source_id'),
                 'provenance': item.get('provenance') or {},
@@ -487,6 +642,31 @@ class Retriever:
             return out
         except Exception as e:
             logger.error(f"Error in retrieve_statutes: {str(e)}")
+            return []
+
+    def retrieve_textbooks(self, query: str, n_results: int = 20, debug: bool = False, aggressive: bool = False):
+        try:
+            query_variants = self._expand_query_variants(query, aggressive=aggressive)
+            docs, trace = self._collect_candidates(
+                collection=self.indexer.textbooks,
+                query_variants=query_variants,
+                n_results=n_results,
+                bm25_index=self.bm25_textbooks,
+                source_kind='textbooks',
+            )
+
+            if not docs:
+                logger.warning(f"No textbook results above relevance threshold {Config.RETRIEVAL_MIN_DISTANCE}")
+                return []
+
+            out = self._finalize_results(query, docs, 'textbooks', n_results)
+            trace.update(self._trace_confidence(out, 'textbooks'))
+            trace['aggressive_rewrite'] = aggressive
+            if debug or self.retrieval_debug:
+                return {'results': out, 'trace': trace}
+            return out
+        except Exception as e:
+            logger.error(f"Error in retrieve_textbooks: {str(e)}")
             return []
 
     def retrieve_regulations(self, query: str, n_results: int = 20, debug: bool = False, aggressive: bool = False):

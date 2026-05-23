@@ -115,6 +115,7 @@ def _normalize_display_source_type(source_type: str | None) -> str:
         'STATUTE': 'U.S. Code',
         'U.S. CODE': 'U.S. Code',
         'REGULATION': 'Regulation',
+        'TEXTBOOK': 'Textbook',
         'SESSION': 'Session Doc',
     }
     if not source_type:
@@ -146,13 +147,15 @@ for message in st.session_state.messages:
         if message.get("metrics"):
             metrics = message["metrics"]
             with st.expander("📊 Metrics", expanded=False):
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("📜 Cases", metrics.get("cases", 0))
                 with col2:
                     st.metric("📋 Statutes", metrics.get("statutes", 0))
                 with col3:
                     st.metric("⚖️ Regulations", metrics.get("regulations", 0))
+                with col4:
+                    st.metric("📚 Textbooks", metrics.get("textbooks", 0))
                 st.caption(f"Total sources: {metrics.get('total', 0)}")
 
 # Chat input
@@ -252,6 +255,21 @@ if query:
                             })
                 except Exception as e:
                     logger.warning(f"Error processing regulations: {str(e)}")
+
+                try:
+                    textbooks = result.get('retrieved_textbooks', []) if isinstance(result.get('retrieved_textbooks'), list) else []
+                    for textbook in textbooks:
+                        if isinstance(textbook, dict):
+                            meta = textbook.get('metadata', {})
+                            citation = meta.get('book_title') or meta.get('source_filename') or meta.get('textbook_id') or 'Unknown'
+                            sources.append({
+                                "type": "Textbook",
+                                "citation": citation,
+                                "distance": coerce_distance(textbook.get('distance')),
+                                "status": "retrieved" if _source_key({"type": "Textbook", "citation": citation}) not in used_source_keys else "used",
+                            })
+                except Exception as e:
+                    logger.warning(f"Error processing textbooks: {str(e)}")
                 
                 sources = _dedupe_sources(sources)
 
@@ -275,6 +293,7 @@ if query:
                 cases_retrieved = len([s for s in sources if s['type'] == 'Case Law'])
                 statutes_retrieved = len([s for s in sources if s['type'] == 'U.S. Code'])
                 regs_retrieved = len([s for s in sources if s['type'] == 'Regulation'])
+                textbooks_retrieved = len([s for s in sources if s['type'] == 'Textbook'])
                 
                 with metrics_col1:
                     st.metric("📜 Cases Retrieved", cases_retrieved)
@@ -284,6 +303,9 @@ if query:
                 
                 with metrics_col3:
                     st.metric("⚖️ Regulations Retrieved", regs_retrieved)
+
+                if textbooks_retrieved > 0:
+                    st.metric("📚 Textbooks Retrieved", textbooks_retrieved)
                 
                 # Calculate average relevance scores (1 - distance, normalized)
                 if cases_retrieved > 0:
@@ -302,10 +324,10 @@ if query:
                     st.write(f"**Regulation Relevance Score:** {avg_reg_score:.1%}" if avg_reg_score is not None else "**Regulation Relevance Score:** n/a")
                 
                 # Overall coverage metric
-                total_sources = cases_retrieved + statutes_retrieved + regs_retrieved
+                total_sources = cases_retrieved + statutes_retrieved + regs_retrieved + textbooks_retrieved
                 if total_sources > 0:
                     st.divider()
-                    coverage_text = f"✓ **Query Coverage:** Found {total_sources} relevant legal sources across {sum([1 for x in [cases_retrieved, statutes_retrieved, regs_retrieved] if x > 0])} source types"
+                    coverage_text = f"✓ **Query Coverage:** Found {total_sources} relevant legal sources across {sum([1 for x in [cases_retrieved, statutes_retrieved, regs_retrieved, textbooks_retrieved] if x > 0])} source types"
                     st.info(coverage_text)
                 
                 # Add to message history
@@ -317,6 +339,7 @@ if query:
                         "cases": cases_retrieved,
                         "statutes": statutes_retrieved,
                         "regulations": regs_retrieved,
+                            "textbooks": textbooks_retrieved,
                         "total": total_sources
                     }
                 })

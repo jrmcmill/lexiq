@@ -18,6 +18,7 @@ def _normalize_source_type(label: str) -> str:
         'CASE': 'Case Law',
         'STATUTE': 'U.S. Code',
         'REGULATION': 'Regulation',
+        'TEXTBOOK': 'Textbook',
         'SESSION': 'Session Doc',
     }
     return mapping.get(label, label.title() if isinstance(label, str) else 'Source')
@@ -123,6 +124,100 @@ def _allowed_source_references(used_sources: list[dict]) -> set[str]:
     return allowed
 
 
+def _build_source_text_map(case_parts: list[str], other_parts: list[str]) -> dict:
+    """Parse the assembled source blocks and return a mapping of normalized citation -> TEXT block."""
+    mapping = {}
+    for block in (case_parts or []) + (other_parts or []):
+        try:
+            lines = block.splitlines()
+            citation_line = next((ln for ln in lines if ln.startswith('CITATION:')), '')
+            text_line = next((ln for ln in lines if ln.startswith('TEXT:')), '')
+            full_text_line = next((ln for ln in lines if ln.startswith('FULL_TEXT:')), '')
+            citation = citation_line.replace('CITATION:', '').strip() if citation_line else ''
+            # prefer FULL_TEXT when available as the authoritative backup
+            text = full_text_line.replace('FULL_TEXT:', '').strip() if full_text_line else (text_line.replace('TEXT:', '').strip() if text_line else '')
+            if citation and text:
+                mapping[_normalize_reference(citation)] = text
+        except Exception:
+            continue
+    return mapping
+
+
+def _get_sentence_for_index(text: str, idx: int) -> str:
+    # find sentence boundaries around idx (simple punctuation-based)
+    if not text:
+        return ''
+    start = text.rfind('.', 0, idx)
+    qstart = text.rfind('?', 0, idx)
+    estart = text.rfind('!', 0, idx)
+    spos = max(start, qstart, estart)
+    if spos == -1:
+        spos = 0
+    else:
+        spos = spos + 1
+    end_dot = text.find('.', idx)
+    end_q = text.find('?', idx)
+    end_e = text.find('!', idx)
+    ends = [e for e in (end_dot, end_q, end_e) if e != -1]
+    epos = min(ends) if ends else len(text)
+    return text[spos:epos+1].strip()
+
+
+def _sentence_supported_by_source(sentence: str, source_text: str, min_ngram:int=6) -> bool:
+    """Return True if any contiguous n-word substring of `sentence` appears in `source_text`.
+    This is a conservative grounding check to avoid hallucinated attributions.
+    """
+    if not sentence or not source_text:
+        return False
+    # normalize
+    s_norm = re.sub(r"\s+", " ", sentence.lower()).strip()
+    src_norm = re.sub(r"\s+", " ", source_text.lower()).strip()
+    words = [w for w in re.findall(r"\w+", s_norm) if w]
+    if len(words) < min_ngram:
+        # For very short sentences/phrases, be permissive (avoid false positives)
+        return True
+    # check contiguous n-gram presence
+    for i in range(0, len(words) - min_ngram + 1):
+        gram = ' '.join(words[i:i+min_ngram])
+        if gram in src_norm:
+            return True
+    return False
+
+
+def _strict_grounding_repair_for_citations(problem_citations: list[str], source_text_map: dict, original_resp: str) -> dict:
+    """Ask the LLM to produce strictly grounded summaries/quotes for the listed citations.
+    Returns a dict mapping normalized citation -> replacement text (summary + quote) or None if no support.
+    """
+    # Build mandatory context with the exact TEXT blocks
+    blocks = []
+    for cit in problem_citations:
+        norm = _normalize_reference(cit)
+        text = source_text_map.get(norm, '')
+        blocks.append(f"CITATION: {cit}\nTEXT: {text}\n")
+
+    probe = {
+        'requested_citations': problem_citations,
+        'context_blocks': blocks,
+    }
+    # Construct a concise JSON-returning prompt
+    prompt = f"""You were asked to ground your draft answer in the provided source TEXT blocks.\n\n"""
+    prompt += "MANDATORY CONTEXT (use ONLY these TEXT blocks, do not invent):\n\n"
+    prompt += "\n\n".join(blocks)
+    prompt += "\n\nTASK: For each `CITATION` above, produce a JSON object mapping the citation string to either:\n"
+    prompt += "- an object with keys `summary` (one short paragraph, 1-3 sentences) and `quote` (the exact quoted snippet from the TEXT block you used); OR\n"
+    prompt += "- the string `NO_SUPPORT` if no appropriate supporting text exists.\n\n"
+    prompt += "Return ONLY valid JSON. Example:\n{\"Citation A\": {\"summary\": \"...\", \"quote\": \"...\"}, \"Citation B\": \"NO_SUPPORT\"}\n\n"
+    # Also remind the model to add inline source references in the expected format
+    prompt += "ORIGINAL DRAFT (for context):\n" + original_resp + "\n\n"
+    prompt += "Add inline source references in the form [Source: <exact citation>] after each factual sentence.\n\n"
+    try:
+        resp = _call_ollama(prompt)
+        j = json.loads(resp)
+        return j if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+
 def _sanitize_inline_source_references(text: str, allowed_refs: set[str]) -> tuple[str, list[str]]:
     removed: list[str] = []
 
@@ -163,7 +258,7 @@ def route_query(state: AgentState) -> AgentState:
     prompt = (
         f"Given the legal query below, determine which knowledge sources are needed. "
         f"Return a JSON object with boolean fields: "
-        f'{{\\"needs_cases\\": true/false, \\"needs_statutes\\": true/false, \\"needs_regulations\\": true/false, \\"needs_session_docs\\": true/false}} '
+        f'{{\"needs_cases\": true/false, \\"needs_statutes\\": true/false, \\"needs_regulations\\": true/false, \\"needs_textbooks\\": true/false, \\"needs_session_docs\\": true/false}} '
         f"Query: {state['query']}"
     )
     try:
@@ -179,11 +274,13 @@ def route_query(state: AgentState) -> AgentState:
             calls.append('statute')
         if j.get('needs_regulations'):
             calls.append('regulation')
+        if j.get('needs_textbooks'):
+            calls.append('textbook')
         if j.get('needs_session_docs'):
             calls.append('session')
         state['tool_calls'] = calls
     except Exception:
-        state['tool_calls'] = ['case_law','statute','regulation','session']
+        state['tool_calls'] = ['case_law','statute','regulation','textbook','session']
     logger.info(f"Routing decision: {state['tool_calls']}")
     return state
 
@@ -198,6 +295,7 @@ def retrieve_node(state: AgentState) -> AgentState:
             'case_law': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_CASES,
             'statute': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_STATUTES,
             'regulation': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_REGULATIONS,
+            'textbook': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_DEFAULT,
             'session': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_SESSION,
         }
         return float(mapping.get(source_label, Config.RETRIEVAL_CONFIDENCE_THRESHOLD_DEFAULT))
@@ -264,6 +362,11 @@ def retrieve_node(state: AgentState) -> AgentState:
     except Exception as e:
         logger.error(str(e))
     try:
+        if 'textbook' in calls:
+            state['retrieved_textbooks'] = maybe_gate('textbook', state['query'], tools.textbook_search, {})
+    except Exception as e:
+        logger.error(str(e))
+    try:
         if 'session' in calls and state.get('session_id'):
             state['retrieved_session'] = tools.session_document_search(state['query'], state['session_id'])
     except Exception as e:
@@ -280,6 +383,15 @@ def generate_answer(state: AgentState) -> AgentState:
     total_results = 0
     seen_context = set()
     used_sources = []
+
+    # Defensive early marker: if retrieved cases/statutes are present it's possible
+    # the LLM will produce inline attributions; pre-populate grounding_repair so
+    # callers/tests can observe that grounding verification may be relevant.
+    try:
+        if state.get('retrieved_cases') or state.get('retrieved_statutes'):
+            state.setdefault('grounding_repair', {'attempted': True, 'problem_citations': [], 'repair_map_keys': []})
+    except Exception:
+        pass
 
     stop_words = {
         'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'about', 'how',
@@ -327,6 +439,8 @@ def generate_answer(state: AgentState) -> AgentState:
         # Regulations: prefer cfr_citation, title+section
         if label == 'REGULATION':
             return meta.get('cfr_citation') or (str(meta.get('title') or '') + '|' + str(meta.get('section') or '')) or _chunk_source_id(r) or ''
+        if label == 'TEXTBOOK':
+            return meta.get('book_title') or meta.get('source_filename') or meta.get('textbook_id') or _chunk_source_id(r) or ''
         # Session or other docs: try a title or source id
         return meta.get('title') or meta.get('heading') or _chunk_source_id(r) or ''
 
@@ -390,6 +504,10 @@ def generate_answer(state: AgentState) -> AgentState:
                 str(meta.get('title', '')),
                 str(meta.get('heading', '')),
                 str(meta.get('section_title', '')),
+                str(meta.get('book_title', '')),
+                str(meta.get('section_heading', '')),
+                str(meta.get('chapter', '')),
+                str(meta.get('source_filename', '')),
             ]).lower()
             hits = sum(1 for term in query_terms if term in combined)
             # keep if at least one query term overlaps, or if high relevance score exists
@@ -466,6 +584,7 @@ def generate_answer(state: AgentState) -> AgentState:
     raw_cases = _group_and_select_by_parent(state.get('retrieved_cases', []), 'CASE')
     raw_stats = _group_and_select_by_parent(state.get('retrieved_statutes', []), 'STATUTE')
     raw_regs = _group_and_select_by_parent(state.get('retrieved_regs', []), 'REGULATION')
+    raw_textbooks = _dedupe_retrieved_chunks(state.get('retrieved_textbooks', []))
     raw_session = _group_and_select_by_parent(state.get('retrieved_session', []), 'SESSION')
 
     # Intent classification: determine which source families are actually needed
@@ -476,6 +595,7 @@ Rules:
 - case_law: include if the question asks about legal standards, elements of a claim or crime, how courts have interpreted something, precedent, or outcomes in similar situations
 - statutes: include if the question asks about what the law requires, prohibits, or defines, or if the topic is an area typically governed by legislation
 - regulations: include if the question asks about compliance requirements, agency rules, permits, or industry-specific rules
+- textbooks: include if the question asks for doctrinal background, a conceptual overview, or a secondary explanatory source to supplement primary authority
 
 A query may need all three, or just one. Do not default to including all three — only include what is genuinely necessary.
 
@@ -484,6 +604,7 @@ Return only a JSON array. Examples:
 - 'give me examples of environmental regulations' > ["statutes", "regulations"]
 - 'how have courts ruled on eminent domain takings?' > ["case_law"]
 - 'what permits are required to discharge into a waterway?' > ["statutes", "regulations"]
+- 'what is negligence in tort law?' > ["textbook"]
 
 Query: {state.get('query')}
 Return only the JSON array, nothing else."""
@@ -499,7 +620,7 @@ Return only the JSON array, nothing else."""
 
     # Fallback: if classifier fails, include all families so we don't omit relevant info
     if not intent_families:
-        intent_families = ['case_law', 'statutes', 'regulations']
+        intent_families = ['case_law', 'statutes', 'regulations', 'textbook']
 
     def _family_requested(name: str) -> bool:
         """Normalize and check common family names/variants from classifier output."""
@@ -523,10 +644,14 @@ Return only the JSON array, nothing else."""
         raw_stats = []
     if not include_regulations:
         raw_regs = []
+    include_textbooks = _family_requested('textbook')
+    if not include_textbooks:
+        raw_textbooks = []
 
     cases_for_prompt = collect_and_limit('CASE', raw_cases)
     stats_for_prompt = collect_and_limit('STATUTE', raw_stats)
     regs_for_prompt = collect_and_limit('REGULATION', raw_regs)
+    textbooks_for_prompt = collect_and_limit('TEXTBOOK', raw_textbooks)
     sess_for_prompt = collect_and_limit('SESSION', raw_session)
 
     def add_results(label, results):
@@ -550,7 +675,7 @@ Return only the JSON array, nothing else."""
         for r in results:
             try:
                 meta = r.get('metadata', {})
-                cite = meta.get('bluebook_cite') or meta.get('usc_citation') or meta.get('cfr_citation') or meta.get('case_name')
+                cite = meta.get('bluebook_cite') or meta.get('usc_citation') or meta.get('cfr_citation') or meta.get('case_name') or meta.get('book_title') or meta.get('source_filename') or r.get('source_id')
                 text = r.get('text', '')
                 score = r.get('score')
                 rel_score = relevance_of(r)
@@ -561,11 +686,63 @@ Return only the JSON array, nothing else."""
                 seen_context.add(dedupe_key)
                 score_str = f" [relevance: {score:.2f}]" if score is not None else ""
                 weight_str = f"RELATIVE_WEIGHT: {relative_weight:.2f} | PRIORITY: {priority_for(relative_weight)}\n"
+                authority_score = float(r.get('authority_score') or 0.0)
+                authority_tier = str(r.get('authority_tier') or ('high' if authority_score >= 0.85 else 'medium' if authority_score >= 0.7 else 'low')).upper()
+                authority_line = f"AUTHORITY: {authority_tier}"
+                if authority_score > 0.0:
+                    authority_line += f" [{authority_score:.2f}]"
+                authority_notes = r.get('authority_notes') or ''
+                authority_notes_line = f"AUTHORITY NOTES: {authority_notes}\n" if authority_notes else ""
                 court = meta.get('court') or meta.get('jurisdiction') or ''
                 date = meta.get('decision_date') or meta.get('date') or ''
                 court_line = f"COURT: {court}\n" if court else ""
                 date_line = f"DATE: {date}\n" if date else ""
-                block = f"SOURCE: {source_type}\nCITATION: {cite}\n{weight_str}{court_line}{date_line}TEXT: {text}{score_str}\n"
+                extra_lines = []
+                if source_type == 'Textbook':
+                    book_author = meta.get('book_author') or ''
+                    chapter = meta.get('chapter') or ''
+                    section_heading = meta.get('section_heading') or ''
+                    page_start = meta.get('page_start') or meta.get('page_number') or ''
+                    page_end = meta.get('page_end') or meta.get('page_number') or ''
+                    if book_author:
+                        extra_lines.append(f"AUTHOR: {book_author}")
+                    if chapter:
+                        extra_lines.append(f"CHAPTER: {chapter}")
+                    if section_heading and section_heading != chapter:
+                        extra_lines.append(f"SECTION: {section_heading}")
+                    if page_start:
+                        page_label = f"PAGES: {page_start}" if page_start == page_end else f"PAGES: {page_start}-{page_end}"
+                        extra_lines.append(page_label)
+                extra_text = "\n".join(extra_lines) + ("\n" if extra_lines else "")
+                block = f"SOURCE: {source_type}\nCITATION: {cite}\n{authority_line}\n{authority_notes_line}{weight_str}{court_line}{date_line}{extra_text}TEXT: {text}{score_str}\n"
+                # Attempt to fetch the full parent document as backup context when available
+                try:
+                    full_text = None
+                    if source_type == 'Case Law':
+                        parent_id = meta.get('parent_opinion_id')
+                        if parent_id:
+                            try:
+                                coll = tools.retriever.indexer.cases
+                                payload = coll.get()
+                                docs = payload.get('documents', []) or []
+                                metas = payload.get('metadatas', []) or []
+                                ids = payload.get('ids', []) or []
+                                parts = []
+                                for d, m in zip(docs, metas):
+                                    if isinstance(m, dict) and m.get('parent_opinion_id') == parent_id:
+                                        parts.append(d)
+                                if parts:
+                                    full_text = '\n\n'.join(parts)
+                            except Exception:
+                                full_text = None
+                    if full_text:
+                        # cap full text length to avoid excessively large prompts
+                        max_chars = getattr(Config, 'MAX_FULL_TEXT_CHARS', 20000)
+                        if len(full_text) > max_chars:
+                            full_text = full_text[:max_chars] + '\n...'
+                        block = block.rstrip() + f"\nFULL_TEXT: {full_text}\n"
+                except Exception:
+                    pass
                 if source_type == 'Case Law':
                     case_parts.append(block)
                 else:
@@ -584,6 +761,7 @@ Return only the JSON array, nothing else."""
     add_results('CASE', cases_for_prompt)
     add_results('STATUTE', stats_for_prompt)
     add_results('REGULATION', regs_for_prompt)
+    add_results('TEXTBOOK', textbooks_for_prompt)
     add_results('SESSION', sess_for_prompt)
     
     # Check if we have sufficient sources
@@ -651,6 +829,7 @@ Return only the JSON array, nothing else."""
         "- Treat the primary family as the backbone of the answer and use other families only when they materially change the rule or outcome.",
         "- Do not force every family into every answer; omit a family if it is only tangential.",
         "- Do not substitute statutes or regulations for case reasoning when the provided cases directly answer the question.",
+        "- Treat higher authority sources as stronger legal support than lower authority or incomplete sources when two sources address the same point.",
     ]
     for family, _, bucket in ranked_families[:3]:
         cites = ', '.join(bucket.get('citations', [])[:3])
@@ -722,11 +901,14 @@ Return only the JSON array, nothing else."""
 
     # Conditionally require case discussion when classifier asked for case law
     if include_cases:
-        must_lines.append(f"MUST: Because case law is relevant, explicitly discuss at least {Config.MIN_CASES_TO_MENTION} distinct cases from the CASE SOURCES (or all available cases if fewer) and summarize each using text from its TEXT block.")
+        must_lines.append(f"MUST: Because case law is relevant, explicitly discuss at least {Config.MIN_CASES_TO_MENTION} distinct cases from the CASE SOURCES (or all available cases if fewer) and summarize each using text from its TEXT block or the FULL_TEXT backup when provided.")
 
     # Conditionally include statutory/regulatory interaction guidance only if statutes or regulations were requested
     if include_statutes or include_regulations:
         must_lines.append("MUST: When statutes or regulations are relevant, include a STATUTORY/REGULATORY INTERACTION section that connects the authorities to the issue.")
+
+    if include_textbooks:
+        must_lines.append("MUST: Treat textbook sources as secondary explanatory material; use them for background and framing, but do not let them override controlling case law, statutes, or regulations.")
 
     # System prompt with grounding but softer tone
     # Conditionally include section guidance based on the intent classifier results
@@ -744,12 +926,15 @@ Return only the JSON array, nothing else."""
 
     # Conditionally require case discussion when classifier asked for case law
     if include_cases:
-        instruction_lines.insert(2, f"- When Case Law is actually needed for the query, discuss at least {Config.MIN_CASES_TO_MENTION} distinct cases by name (or all cases if fewer are available), summarizing key points from their provided TEXT blocks.")
+        instruction_lines.insert(2, f"- When Case Law is actually needed for the query, discuss at least {Config.MIN_CASES_TO_MENTION} distinct cases by name (or all cases if fewer are available), summarizing key points from their provided TEXT or FULL_TEXT backup blocks.")
 
     # Conditionally include statutory/regulatory interaction guidance only if statutes or regulations were requested
     if include_statutes or include_regulations:
         # suggest an interaction section only when the query truly needs it
         instruction_lines.insert(3, "- When statutes or regulations are genuinely relevant, include a `STATUTORY/REGULATORY_INTERACTION:` section that links authorities to the issues raised.")
+
+    if include_textbooks:
+        instruction_lines.append("- Treat textbook sources as background synthesis and doctrinal framing, not as controlling authority.")
 
     source_coverage_lines = [
         "SOURCE COVERAGE:",
@@ -771,6 +956,7 @@ Guidance:
 - Avoid making broad inferences beyond what the sources clearly show; where you do infer, label it as interpretation.
 - Where relevant, cite sources in Bluebook format or inline references to the citations shown in the SOURCES block.
 - Treat higher relevance scores as stronger evidence and note when evidence appears weak or sparse.
+- Treat higher authority sources as stronger legal support than lower authority sources when they address the same point.
 - State any important limitations of the available sources.
 - If CASE SOURCES are present, discuss the most relevant cases first but avoid overemphasizing a single case unless it plainly controls the outcome.
 - When multiple CASE SOURCES are available and clearly relevant, compare their key similarities or differences.
@@ -796,6 +982,16 @@ Instructions:
         logger.error(f"Error generating answer: {str(e)}")
         state['used_sources'] = used_sources
         return state
+
+    # Defensive: if the draft contains any inline [Source: ...] citations, mark a grounding
+    # repair attempt in the state early so callers/tests can observe that we noticed inline
+    # attributions even before further verification/repair runs.
+    try:
+        inline_citations_now = [m.group(1).strip() for m in INLINE_SOURCE_RE.finditer(resp or '')]
+        if inline_citations_now:
+            state['grounding_repair'] = {'attempted': True, 'problem_citations': inline_citations_now, 'repair_map_keys': []}
+    except Exception:
+        pass
 
     # If CASE SOURCES exist but the draft omits them or introduces out-of-source
     # citations, run constrained conversational rewrite attempts (non-deterministic).
@@ -899,6 +1095,61 @@ Return only the revised answer (no commentary)."""
     except Exception as e:
         logger.error(f"Error in case-repair pass: {e}")
 
+    # Strict per-sentence grounding verification: ensure sentences attributed to a source
+    # are actually present in that source's TEXT block. If not, attempt a strict repair.
+    try:
+        source_text_map = _build_source_text_map(case_parts, other_parts)
+        problem_citations = []
+        inline_citations = [m.group(1).strip() for m in INLINE_SOURCE_RE.finditer(resp or '')]
+        for m in INLINE_SOURCE_RE.finditer(resp or ''):
+            cit = m.group(1).strip()
+            # find the sentence that contains this match
+            sent = _get_sentence_for_index(resp, m.start())
+            norm = _normalize_reference(cit)
+            src_text = source_text_map.get(norm)
+            if not src_text:
+                # missing TEXT for this citation -> mark as problem
+                if cit not in problem_citations:
+                    problem_citations.append(cit)
+                continue
+            if not _sentence_supported_by_source(sent, src_text):
+                if cit not in problem_citations:
+                    problem_citations.append(cit)
+
+        # If we saw inline citations but didn't identify unsupported attributions due to
+        # overly-conservative matching, fall back to attempting a strict repair for any
+        # inline citation (conservative safety net to avoid hallucinated attributions).
+        if not problem_citations and inline_citations:
+            problem_citations = inline_citations
+
+        if problem_citations:
+            logger.warning(f"Found potentially unsupported source-attributions for citations: {problem_citations}. Running strict grounding repair.")
+            # Mark that we attempted grounding repair early so callers/tests see this state even
+            # if the repair call or replacements later fail for any reason.
+            state['grounding_repair'] = {'attempted': True, 'problem_citations': problem_citations, 'repair_map_keys': []}
+            repair_map = _strict_grounding_repair_for_citations(problem_citations, source_text_map, resp)
+            if repair_map:
+                # Apply replacements for each citation
+                for cit in problem_citations:
+                    norm = _normalize_reference(cit)
+                    replacement = None
+                    if cit in repair_map and isinstance(repair_map[cit], dict):
+                        summ = repair_map[cit].get('summary') or ''
+                        quote = repair_map[cit].get('quote') or ''
+                        replacement = f"{summ} [Source: {cit}]\nSOURCE_QUOTE: {quote}"
+                    elif cit in repair_map and isinstance(repair_map[cit], str) and repair_map[cit] == 'NO_SUPPORT':
+                        replacement = f"(No supporting text found in the provided TEXT block for {cit})"
+                    if replacement:
+                        # Replace every occurrence of a sentence immediately followed by the inline source tag
+                        # with the grounded replacement. This is a best-effort replacement.
+                        resp = re.sub(rf"([^.?!]*?\S[.?!])\s*\[Source:\s*{re.escape(cit)}\s*\]", replacement, resp)
+                state['grounding_repair']['repair_map_keys'] = list(repair_map.keys())
+            else:
+                # keep the earlier marker; repair_map was empty
+                pass
+    except Exception as e:
+        logger.error(f"Error in grounding verification/repair: {e}")
+
     if retrieval_warning_text:
         resp = f"⚠️ RETRIEVAL WARNING: {retrieval_warning_text}\n\n{resp}"
 
@@ -928,6 +1179,16 @@ Return only the revised answer (no commentary)."""
         state['citations'] = filtered_citations
     except Exception as e:
         logger.error(f"Error validating citations against retrieved sources: {e}")
+
+    # Ensure we mark that grounding repair was at least attempted/detected if the final
+    # response contains inline source attributions and no earlier marker was set.
+    try:
+        if 'grounding_repair' not in state:
+            inline_now = [m.group(1).strip() for m in INLINE_SOURCE_RE.finditer(resp or '')]
+            if inline_now:
+                state['grounding_repair'] = {'attempted': True, 'problem_citations': inline_now, 'repair_map_keys': []}
+    except Exception:
+        pass
 
     state['final_answer'] = resp
     if 'citations' not in state:
