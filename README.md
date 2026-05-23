@@ -8,7 +8,7 @@ through a Streamlit app with search, chat, document, and evaluation workflows.
 
 - Searches and answers questions over federal case law, U.S. Code, CFR, and uploaded documents.
 - Prioritizes case sources in the answer prompt when case law is available.
-- Uses retrieval expansion, reranking, and source trimming to reduce noisy context.
+- Uses retrieval expansion, reranking, citation graph expansion, and source trimming to reduce noisy context.
 - Shows which sources were retrieved versus actually used in the prompt.
 - Supports incremental data refresh and re-indexing from the UI.
 
@@ -20,9 +20,11 @@ flowchart TD
   Chat --> Agent[Query routing + answer generation]
   Agent --> Retriever[Case / statute / regulation retrieval]
   Retriever --> Chroma[Persistent ChromaDB collections]
+  Retriever --> Graph[Citation graph]
   Agent --> Ollama[Local LLM via Ollama]
   Data[CourtListener / GovInfo / eCFR / uploads] --> Ingest[Fetch + preprocess + index]
   Ingest --> Chroma
+  Ingest --> Graph
 ```
 
 The current answer pipeline is case-first when cases exist. The agent also performs a
@@ -33,17 +35,18 @@ introduces citations that were not provided in the source set.
 
 ```text
 src/
-  config.py                  # Environment settings and defaults
+  config.py                 # Environment settings and defaults
   observability/logger.py    # Structured JSON logging
-  data/                      # CourtListener, GovInfo, eCFR, preprocessing
-  rag/                       # Embedder, reranker, indexer, retriever
+  data/                     # CourtListener, GovInfo, eCFR, preprocessing
+  rag/                      # Embedder, reranker, indexer, retriever, citation graph
   agent/                    # Routing, retrieval orchestration, citations
   documents/                # Upload parsing, session store, comparison
   evaluation/               # Judge, benchmarks, metrics
 streamlit_app.py            # Main chat UI
-pages/                      # Explorer, document workspace, lookup, eval, refresh
-scripts/setup_full.py       # Full fetch / preprocess / index CLI
-tests/                      # Unit tests
+pages/                     # Explorer, document workspace, lookup, eval, refresh
+scripts/setup_full.py      # Full fetch / preprocess / index / graph build CLI
+scripts/setup_citation_graph.py # Graph rebuild-only CLI
+tests/                     # Unit tests
 ```
 
 Generated or rebuildable artifacts live in `chroma_db/`, `data/raw/`, `data/processed/`,
@@ -65,12 +68,19 @@ This creates `.venv` and installs the Python dependencies.
 make setup
 ```
 
-This fetches and indexes the default corpora:
+This fetches and indexes the default corpora and also builds the citation graph:
 
 - CourtListener case law
 - U.S. Code granules, if `GOVINFO_API_KEY` is available
 - eCFR titles
 - Preprocessing and ChromaDB indexing
+- Citation graph construction
+
+If you already have the raw and processed data in place and only want to refresh the graph, run:
+
+```bash
+make setup-citation-graph
+```
 
 ### 3. Start Ollama
 
@@ -93,8 +103,6 @@ source .venv/bin/activate
 streamlit run streamlit_app.py
 ```
 
-## Custom ingestion
-
 For larger or smaller local corpora, use the custom setup target:
 
 ```bash
@@ -116,6 +124,7 @@ Available settings include:
 - `OLLAMA_MODEL`, `OLLAMA_BASE_URL`
 - `EMBED_MODEL`, `RERANK_MODEL`
 - `COURTLISTENER_API_KEY`, `GOVINFO_API_KEY`, `CONGRESS_API_KEY`
+- `ENABLE_CITATION_GRAPH`, `CITATION_GRAPH_HOPS`, `CITATION_GRAPH_MAX_NODES`
 - `RETRIEVAL_MIN_DISTANCE`, `RERANK_MIN_SCORE`
 - `OLLAMA_TEMPERATURE`, `OLLAMA_TOP_P`, `OLLAMA_TOP_K`
 - `MAX_DOCS_PER_TOOL`, `MAX_NON_CASE_DOCS_PER_TOOL`, `MAX_CASE_REPAIR_ATTEMPTS`
@@ -156,7 +165,7 @@ The defaults are tuned for grounded legal answers rather than creative generatio
 ### Data Refresh
 
 - Incrementally fetch new court opinions, U.S. Code granules, and CFR titles.
-- Optionally reprocess and reindex after refresh.
+- Optionally reprocess, reindex, and rebuild the citation graph after refresh.
 
 ## Grounding and retrieval behavior
 
@@ -165,6 +174,7 @@ LexIQ currently uses a few layers to keep responses closer to the sources:
 - Query expansion for a curated set of legal topics.
 - BM25 lexical fallback alongside dense retrieval.
 - Reranking to prefer stronger candidates.
+- Citation graph expansion for sources linked by citations or statutory/regulatory references.
 - Case grouping so one opinion does not swamp the prompt with duplicate chunks.
 - A smaller non-case prompt budget so statutes and regulations do not crowd out cases.
 - An LLM repair pass when the draft answer omits the retrieved case or cites unsupported authorities.
@@ -184,15 +194,17 @@ or:
 ```
 
 The repo includes tests for agent routing, retrieval behavior, citations, document comparison,
-evaluation parsing, and UI helper utilities.
+evaluation parsing, citation graph construction, and UI helper utilities.
 
 ## Troubleshooting
 
 - If Ollama is not running, start it with `ollama serve`.
 - If U.S. Code fetch is skipped, check whether `GOVINFO_API_KEY` is set.
 - If the index looks stale or corrupted, run `make clean && make setup`.
+- If the citation graph looks stale, run `make setup-citation-graph`.
 - If imports fail, reinstall with `make install`.
 
 ## Legal note
 
 LexIQ is a research tool, not legal advice.
+or:

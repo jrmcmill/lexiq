@@ -30,6 +30,8 @@ def run_query(query: str, session_id: str, history: list[dict], court_filter: st
         'date_after': date_after,
         'date_before': date_before,
         'error': None,
+        'retrieval_warnings': [],
+        'retrieval_confidence': {},
     }
     state = route_query(state)
     state = retrieve_node(state)

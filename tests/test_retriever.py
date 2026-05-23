@@ -47,8 +47,8 @@ def test_hybrid_score_prefers_strong_title_signal():
 
 def test_finalize_results_blends_hybrid_and_rerank(monkeypatch, retriever):
     candidates = [
-        {'text': 'doc1', 'metadata': {'bluebook_cite': 'A'}, 'hybrid_score': 0.9, 'distance': 0.1, 'semantic_score': 0.8, 'bm25_score': 0.9, 'title_score': 0.2},
-        {'text': 'doc2', 'metadata': {'bluebook_cite': 'B'}, 'hybrid_score': 0.2, 'distance': 0.2, 'semantic_score': 0.2, 'bm25_score': 0.1, 'title_score': 0.0},
+        {'text': 'doc1', 'metadata': {'bluebook_cite': 'A', 'case_name': 'Doc One', 'parent_opinion_id': 1}, 'hybrid_score': 0.9, 'distance': 0.1, 'semantic_score': 0.8, 'bm25_score': 0.9, 'title_score': 0.2},
+        {'text': 'doc2', 'metadata': {'bluebook_cite': 'B', 'case_name': 'Doc Two', 'parent_opinion_id': 2}, 'hybrid_score': 0.2, 'distance': 0.2, 'semantic_score': 0.2, 'bm25_score': 0.1, 'title_score': 0.0},
     ]
     monkeypatch.setattr(retriever, 'reranker', MagicMock(rerank=lambda q, r, top_k=None: [dict(r[1], rerank_score=0.95), dict(r[0], rerank_score=0.30)]))
     res = retriever._finalize_results('query', candidates, 'cases', 2)
@@ -96,3 +96,59 @@ def test_retrieve_session_docs_no_collection(monkeypatch, retriever):
     retriever.indexer.client.get_collection.side_effect = Exception('no collection')
     res = retriever.retrieve_session_docs('q','nosess')
     assert res == []
+
+
+def test_expand_with_citation_graph_merges_neighbor_chunks(monkeypatch, retriever):
+    retriever.indexer.cases = MagicMock()
+    retriever.indexer.cases.get = MagicMock(return_value={
+        'ids': ['case_2_0'],
+        'documents': ['neighbor doc'],
+        'metadatas': [{'bluebook_cite': 'B', 'parent_opinion_id': 2}],
+    })
+
+    class FakeGraph:
+        def __init__(self):
+            self.nodes = {'case:1': True}
+
+        def node_for_result(self, result, source_kind):
+            return 'case:1'
+
+        def expand(self, seed_node_ids, max_hops=1, max_nodes=12):
+            return [{
+                'node_id': 'case:2',
+                'kind': 'case',
+                'label': 'B',
+                'metadata': {'parent_opinion_id': 2},
+                'chunk_ids': ['case_2_0'],
+                'distance': 1,
+                'score': 0.5,
+                'relation': 'case_cites',
+                'direction': 'out',
+                'seed_node_id': 'case:1',
+            }]
+
+        def fetch_spec(self, node_id):
+            return {
+                'kind': 'case',
+                'label': 'B',
+                'metadata': {'parent_opinion_id': 2},
+                'chunk_ids': ['case_2_0'],
+                'node_id': node_id,
+            }
+
+    retriever.citation_graph = FakeGraph()
+    base = [{
+        'text': 'seed doc',
+        'metadata': {'bluebook_cite': 'A', 'parent_opinion_id': 1},
+        'distance': 0.1,
+        'semantic_score': 0.9,
+        'bm25_score': 0.8,
+        'title_score': 0.0,
+        'source_id': 'case_1_0',
+        'provenance': {'cite': 'A'},
+    }]
+
+    merged, trace = retriever._expand_with_citation_graph(base, 'cases')
+
+    assert trace['graph_expanded'] == 1
+    assert any(item['metadata'].get('bluebook_cite') == 'B' for item in merged)

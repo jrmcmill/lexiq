@@ -21,6 +21,7 @@ from src.data.courtlistener import CourtListenerClient
 from src.data.uscode import USCodeClient
 from src.data.ecfr import ECFRClient
 from src.config import Config
+from src.rag.citation_graph import build_citation_graph
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('update_db')
@@ -88,4 +89,12 @@ if __name__ == '__main__':
     c = update_courtlistener()
     u = update_uscode()
     e = update_ecfr()
+    graph_stats = build_citation_graph(
+        cases_parquet=os.path.join(os.getcwd(), 'data', 'processed', 'cases.parquet'),
+        statutes_parquet=os.path.join(os.getcwd(), 'data', 'processed', 'statutes.parquet'),
+        regs_parquet=os.path.join(os.getcwd(), 'data', 'processed', 'regulations.parquet'),
+        raw_cases_dir=os.path.join(os.getcwd(), 'data', 'raw', 'courtlistener'),
+        persist_dir=Config.CHROMA_PERSIST_DIR,
+    )
+    logger.info(f"Citation graph refreshed: {graph_stats.get('nodes')} nodes, {graph_stats.get('out_edges')} edges")
     logger.info(f"Update summary: courtlistener={c}, uscode={u}, ecfr={e}")

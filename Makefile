@@ -14,6 +14,10 @@ setup-full:
 	# Full ingestion: fetch all available raw data, preprocess, and index
 	.venv/bin/python scripts/setup_full.py
 
+setup-citation-graph:
+	# Rebuild only the citation graph from existing raw and processed data
+	.venv/bin/python scripts/setup_citation_graph.py
+
 app:
 	.venv/bin/streamlit run streamlit_app.py
 

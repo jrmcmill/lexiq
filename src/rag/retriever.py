@@ -2,6 +2,7 @@ from src.rag.indexer import Indexer
 from src.rag.embedder import Embedder
 from src.rag.reranker import Reranker
 from src.rag.bm25_index import BM25Index
+from src.rag.citation_graph import CitationGraph
 from src.config import Config
 from src.observability.logger import get_logger
 
@@ -25,12 +26,16 @@ class Retriever:
         'free speech': ['first amendment', 'content based', 'prior restraint'],
     }
     MAX_QUERY_VARIANTS = 5
+    MAX_AGGRESSIVE_QUERY_VARIANTS = 8
 
     def __init__(self):
         self.indexer = Indexer()
         self.embedder = Embedder()
         self.reranker = Reranker()
         self.retrieval_debug = Config.RETRIEVAL_DEBUG
+        self.citation_graph = CitationGraph()
+        if Config.ENABLE_CITATION_GRAPH:
+            self.citation_graph.load()
         # load BM25 indexes (if present)
         persist = Config.CHROMA_PERSIST_DIR
         self.bm25_cases = BM25Index(persist, "cases")
@@ -120,6 +125,173 @@ class Retriever:
             return (0.52, 0.48)
         return (0.50, 0.50)
 
+    def _graph_blend_weight(self, source_kind: str) -> float:
+        if source_kind == 'cases':
+            return 0.10
+        if source_kind in {'statutes', 'regs'}:
+            return 0.08
+        return 0.05
+
+    def _source_collection(self, source_kind: str):
+        normalized = self._normalize_graph_source_kind(source_kind)
+        if normalized == 'cases':
+            return self.indexer.cases
+        if normalized == 'statutes':
+            return self.indexer.statutes
+        return self.indexer.regs
+
+    def _normalize_graph_source_kind(self, source_kind: str) -> str:
+        normalized = str(source_kind or '').strip().lower()
+        if normalized in {'case', 'cases'}:
+            return 'cases'
+        if normalized in {'statute', 'statutes', 'usc'}:
+            return 'statutes'
+        if normalized in {'reg', 'regs', 'regulation', 'regulations', 'cfr'}:
+            return 'regs'
+        return normalized
+
+    def _source_confidence_threshold(self, source_kind: str) -> float:
+        mapping = {
+            'cases': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_CASES,
+            'statutes': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_STATUTES,
+            'regs': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_REGULATIONS,
+            'session': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_SESSION,
+        }
+        return float(mapping.get(self._normalize_graph_source_kind(source_kind), Config.RETRIEVAL_CONFIDENCE_THRESHOLD_DEFAULT))
+
+    def _average_result_score(self, results: list[dict]) -> float:
+        scores = []
+        for item in results or []:
+            if not isinstance(item, dict):
+                continue
+            score = self._safe_float(item.get('score'))
+            if score is None:
+                score = self._safe_float(item.get('hybrid_score'))
+            if score is None:
+                score = self._safe_float(item.get('rerank_score'))
+            if score is not None:
+                scores.append(score)
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def _trace_confidence(self, results: list[dict], source_kind: str) -> dict:
+        average_score = self._average_result_score(results)
+        threshold = self._source_confidence_threshold(source_kind)
+        return {
+            'average_score': average_score,
+            'confidence_threshold': threshold,
+            'confidence_below_threshold': average_score < threshold,
+            'result_count': len(results or []),
+        }
+
+    def _merge_candidate(self, candidate_map: dict, item: dict, source_kind: str):
+        key_fn = self._case_result_key if source_kind == 'cases' else self._statute_result_key if source_kind == 'statutes' else self._regulation_result_key
+        key = key_fn(item)
+        candidate = candidate_map.get(key)
+        if candidate is None:
+            candidate = {
+                'text': item.get('text', ''),
+                'metadata': item.get('metadata', {}) or {},
+                'distance': item.get('distance'),
+                'semantic_score': item.get('semantic_score', 0.0),
+                'bm25_score': item.get('bm25_score', 0.0),
+                'title_score': item.get('title_score', 0.0),
+                'graph_score': item.get('graph_score', 0.0),
+                'source_id': item.get('source_id'),
+                'provenance': item.get('provenance') or {},
+                'source_kind': source_kind,
+            }
+            candidate_map[key] = candidate
+            return candidate
+
+        if item.get('text') and not candidate.get('text'):
+            candidate['text'] = item.get('text')
+        if item.get('metadata') and not candidate.get('metadata'):
+            candidate['metadata'] = item.get('metadata')
+        item_distance = item.get('distance')
+        candidate_distance = candidate.get('distance')
+        if candidate_distance is None or (item_distance is not None and item_distance < candidate_distance):
+            candidate['distance'] = item_distance
+        candidate['semantic_score'] = max(candidate.get('semantic_score', 0.0), item.get('semantic_score', 0.0) or 0.0)
+        candidate['bm25_score'] = max(candidate.get('bm25_score', 0.0), item.get('bm25_score', 0.0) or 0.0)
+        candidate['title_score'] = max(candidate.get('title_score', 0.0), item.get('title_score', 0.0) or 0.0)
+        candidate['graph_score'] = max(candidate.get('graph_score', 0.0), item.get('graph_score', 0.0) or 0.0)
+        if item.get('source_id') and not candidate.get('source_id'):
+            candidate['source_id'] = item.get('source_id')
+        if item.get('provenance') and not candidate.get('provenance'):
+            candidate['provenance'] = item.get('provenance')
+        return candidate
+
+    def _fetch_graph_documents(self, node_info: dict, source_kind: str) -> list[dict]:
+        if not node_info:
+            return []
+        collection = self._source_collection(source_kind)
+        if not collection:
+            return []
+        chunk_ids = node_info.get('chunk_ids') or []
+        if not chunk_ids:
+            return []
+        try:
+            payload = collection.get(ids=chunk_ids)
+        except Exception:
+            return []
+
+        documents = payload.get('documents', []) or []
+        metadatas = payload.get('metadatas', []) or []
+        ids = payload.get('ids', []) or chunk_ids
+        out = []
+        for doc, meta, chunk_id in zip(documents, metadatas, ids):
+            if not isinstance(doc, str) or not isinstance(meta, dict):
+                continue
+            out.append({
+                'text': doc,
+                'metadata': meta,
+                'distance': None,
+                'semantic_score': 0.0,
+                'bm25_score': 0.0,
+                'title_score': 0.0,
+                'graph_score': node_info.get('score', 0.0),
+                'source_id': chunk_id,
+                'provenance': {'graph_node_id': node_info.get('node_id'), 'graph_relation': node_info.get('relation')},
+                'source_kind': source_kind,
+            })
+        return out
+
+    def _expand_with_citation_graph(self, results: list[dict], source_kind: str) -> tuple[list[dict], dict]:
+        if not Config.ENABLE_CITATION_GRAPH or not getattr(self.citation_graph, 'nodes', None):
+            return results, {'graph_expanded': 0}
+
+        seed_nodes = []
+        for item in results[:max(1, min(len(results), 5))]:
+            node_id = self.citation_graph.node_for_result(item, source_kind)
+            if node_id:
+                seed_nodes.append(node_id)
+        if not seed_nodes:
+            return results, {'graph_expanded': 0}
+
+        expansions = self.citation_graph.expand(
+            seed_nodes,
+            max_hops=Config.CITATION_GRAPH_HOPS,
+            max_nodes=Config.CITATION_GRAPH_MAX_NODES,
+        )
+        if not expansions:
+            return results, {'graph_expanded': 0}
+
+        candidate_map = {}
+        for item in results:
+            self._merge_candidate(candidate_map, item, source_kind)
+
+        graph_docs = []
+        for node_info in expansions:
+            node = self.citation_graph.fetch_spec(node_info.get('node_id')) or {}
+            graph_docs.extend(self._fetch_graph_documents({**node_info, **node}, source_kind=self._normalize_graph_source_kind(node_info.get('kind', source_kind))))
+
+        for item in graph_docs:
+            self._merge_candidate(candidate_map, item, item.get('source_kind', source_kind))
+
+        merged = list(candidate_map.values())
+        trace = {'graph_expanded': len(graph_docs), 'graph_nodes': len(expansions), 'seed_nodes': seed_nodes}
+        return merged, trace
+
     def _finalize_results(self, query: str, candidates: list[dict], source_kind: str, n_results: int) -> list[dict]:
         if not candidates:
             return []
@@ -156,7 +328,10 @@ class Retriever:
                 rerank_norm = 1.0
 
             hybrid_score = max(0.0, min(1.0, self._safe_float(item.get('hybrid_score')) or 0.0))
-            final_score = (hybrid_weight * hybrid_score) + (rerank_weight * rerank_norm)
+            graph_score = max(0.0, min(1.0, self._safe_float(item.get('graph_score')) or 0.0))
+            graph_weight = self._graph_blend_weight(source_kind)
+            base_weight = max(0.0, 1.0 - graph_weight)
+            final_score = base_weight * ((hybrid_weight * hybrid_score) + (rerank_weight * rerank_norm)) + (graph_weight * graph_score)
             # compute contribution breakdown for transparency
             try:
                 weights = self._source_weights(source_kind, query)
@@ -179,6 +354,7 @@ class Retriever:
                 'title': round(weights.get('title', 0.0) * title, 6),
                 'synergy': round(synergy_val, 6),
                 'rerank': round(rerank_norm * rerank_weight, 6),
+                'graph': round(graph_weight * graph_score, 6),
             }
 
             scored_results.append({
@@ -247,7 +423,7 @@ class Retriever:
 
     def retrieve_cases(self, query: str, n_results: int = 20, court_filter: str | None = None,
                        date_after: str | None = None, date_before: str | None = None,
-                       debug: bool = False):
+                       debug: bool = False, aggressive: bool = False):
         try:
             # Build where clause only if filters are present
             ands = []
@@ -258,7 +434,7 @@ class Retriever:
             if date_before:
                 ands.append({"date_filed": {"$lte": date_before}})
 
-            query_variants = self._expand_query_variants(query)
+            query_variants = self._expand_query_variants(query, aggressive=aggressive)
             docs, trace = self._collect_candidates(
                 collection=self.indexer.cases,
                 query_variants=query_variants,
@@ -267,6 +443,8 @@ class Retriever:
                 bm25_index=self.bm25_cases,
                 source_kind='cases',
             )
+            docs, graph_trace = self._expand_with_citation_graph(docs, 'cases')
+            trace.update(graph_trace)
 
             if not docs:
                 logger.warning(f"No case results above relevance threshold {Config.RETRIEVAL_MIN_DISTANCE}")
@@ -275,6 +453,8 @@ class Retriever:
             out = self._finalize_results(query, docs, 'cases', n_results)
             if not out:
                 logger.warning(f"No case results above reranking threshold {Config.RERANK_MIN_SCORE}")
+            trace.update(self._trace_confidence(out, 'cases'))
+            trace['aggressive_rewrite'] = aggressive
             if debug or self.retrieval_debug:
                 return {'results': out, 'trace': trace}
             return out
@@ -282,9 +462,9 @@ class Retriever:
             logger.error(f"Error in retrieve_cases: {str(e)}")
             return []
 
-    def retrieve_statutes(self, query: str, n_results: int = 20, debug: bool = False):
+    def retrieve_statutes(self, query: str, n_results: int = 20, debug: bool = False, aggressive: bool = False):
         try:
-            query_variants = self._expand_query_variants(query)
+            query_variants = self._expand_query_variants(query, aggressive=aggressive)
             docs, trace = self._collect_candidates(
                 collection=self.indexer.statutes,
                 query_variants=query_variants,
@@ -292,12 +472,16 @@ class Retriever:
                 bm25_index=self.bm25_statutes,
                 source_kind='statutes',
             )
+            docs, graph_trace = self._expand_with_citation_graph(docs, 'statutes')
+            trace.update(graph_trace)
 
             if not docs:
                 logger.warning(f"No statute results above relevance threshold {Config.RETRIEVAL_MIN_DISTANCE}")
                 return []
 
             out = self._finalize_results(query, docs, 'statutes', n_results)
+            trace.update(self._trace_confidence(out, 'statutes'))
+            trace['aggressive_rewrite'] = aggressive
             if debug or self.retrieval_debug:
                 return {'results': out, 'trace': trace}
             return out
@@ -305,9 +489,9 @@ class Retriever:
             logger.error(f"Error in retrieve_statutes: {str(e)}")
             return []
 
-    def retrieve_regulations(self, query: str, n_results: int = 20, debug: bool = False):
+    def retrieve_regulations(self, query: str, n_results: int = 20, debug: bool = False, aggressive: bool = False):
         try:
-            query_variants = self._expand_query_variants(query)
+            query_variants = self._expand_query_variants(query, aggressive=aggressive)
             docs, trace = self._collect_candidates(
                 collection=self.indexer.regs,
                 query_variants=query_variants,
@@ -315,12 +499,16 @@ class Retriever:
                 bm25_index=self.bm25_regs,
                 source_kind='regs',
             )
+            docs, graph_trace = self._expand_with_citation_graph(docs, 'regs')
+            trace.update(graph_trace)
 
             if not docs:
                 logger.warning(f"No regulation results above relevance threshold {Config.RETRIEVAL_MIN_DISTANCE}")
                 return []
 
             out = self._finalize_results(query, docs, 'regs', n_results)
+            trace.update(self._trace_confidence(out, 'regs'))
+            trace['aggressive_rewrite'] = aggressive
             if debug or self.retrieval_debug:
                 return {'results': out, 'trace': trace}
             return out
@@ -448,7 +636,7 @@ class Retriever:
             logger.error(f"Error in retrieve_by_title: {e}")
             return []
 
-    def _expand_query_variants(self, query: str) -> list[str]:
+    def _expand_query_variants(self, query: str, aggressive: bool = False) -> list[str]:
         normalized = self._normalize_query(query)
         # guard: if expansion disabled or query looks like a citation/case name, avoid expansions
         if not Config.ENABLE_QUERY_EXPANSION:
@@ -498,11 +686,13 @@ class Retriever:
             if len(variants) >= self.MAX_QUERY_VARIANTS:
                 return variants[:self.MAX_QUERY_VARIANTS]
 
-        if combined_terms and len(variants) < self.MAX_QUERY_VARIANTS:
-            combo = ' '.join([query] + combined_terms[:3])
+        if combined_terms and len(variants) < (self.MAX_AGGRESSIVE_QUERY_VARIANTS if aggressive else self.MAX_QUERY_VARIANTS):
+            combo_terms = combined_terms if aggressive else combined_terms[:3]
+            combo = ' '.join([query] + combo_terms[:5])
             add_variant(combo)
 
-        return variants[:self.MAX_QUERY_VARIANTS]
+        limit = self.MAX_AGGRESSIVE_QUERY_VARIANTS if aggressive else self.MAX_QUERY_VARIANTS
+        return variants[:limit]
 
     def _normalize_query(self, value: str) -> str:
         return ' '.join((value or '').replace('§', 'section').split()).strip().lower()

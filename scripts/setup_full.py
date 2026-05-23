@@ -21,6 +21,7 @@ from src.data.uscode import USCodeClient
 from src.data.ecfr import ECFRClient
 from src.data.preprocessor import Preprocessor
 from src.rag.indexer import Indexer
+from src.rag.citation_graph import build_citation_graph
 from src.config import Config
 from src.observability.logger import get_logger
 from tqdm import tqdm
@@ -90,6 +91,16 @@ def preprocess_and_index():
     idx.index_statutes(statutes)
     idx.index_regulations(regs)
 
+    print("Building citation graph...")
+    graph_stats = build_citation_graph(
+        cases_parquet=os.path.join(os.getcwd(), 'data', 'processed', 'cases.parquet'),
+        statutes_parquet=os.path.join(os.getcwd(), 'data', 'processed', 'statutes.parquet'),
+        regs_parquet=os.path.join(os.getcwd(), 'data', 'processed', 'regulations.parquet'),
+        raw_cases_dir=os.path.join(os.getcwd(), 'data', 'raw', 'courtlistener'),
+        persist_dir=Config.CHROMA_PERSIST_DIR,
+    )
+    print(f"Citation graph: {graph_stats.get('nodes')} nodes, {graph_stats.get('out_edges')} edges")
+
     stats = idx.get_collection_stats()
     print(f"Index stats: {stats}")
     return stats
@@ -112,14 +123,22 @@ def main():
     start = datetime.utcnow()
     print(f"Starting setup at {start.isoformat()}Z")
 
+    total_steps = 4 if args.reindex else 3
+    steps = tqdm(total=total_steps, desc='LexIQ setup', unit='step')
+
     # fetch
     fetch_courtlistener(target_cases=args.cases, max_pages=args.case_pages)
+    steps.update(1)
     fetch_uscode(target_granules=args.granules, max_pages=args.granule_pages)
+    steps.update(1)
     fetch_ecfr(titles_to_check=args.ecfr_titles)
+    steps.update(1)
 
     # preprocess + index
     if args.reindex:
         preprocess_and_index()
+        steps.update(1)
+    steps.close()
 
     end = datetime.utcnow()
     print(f"Completed setup at {end.isoformat()}Z — duration: {end - start}")

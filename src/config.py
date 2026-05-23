@@ -19,6 +19,7 @@ class Config:
     CHROMA_STATUTES_COLLECTION: str = os.getenv("CHROMA_STATUTES_COLLECTION", "lexiq_statutes")
     CHROMA_REGULATIONS_COLLECTION: str = os.getenv("CHROMA_REGULATIONS_COLLECTION", "lexiq_regulations")
     CHROMA_TITLES_COLLECTION: str = os.getenv("CHROMA_TITLES_COLLECTION", "lexiq_titles")
+    CITATION_GRAPH_FILENAME: str = os.getenv("CITATION_GRAPH_FILENAME", "citation_graph.json")
     EMBED_MODEL: str = os.getenv("EMBED_MODEL", "BAAI/bge-large-en-v1.5")
     RERANK_MODEL: str = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
@@ -40,13 +41,31 @@ class Config:
     OLLAMA_TEMPERATURE: float = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
     OLLAMA_TOP_P: float = float(os.getenv("OLLAMA_TOP_P", "0.15"))
     OLLAMA_TOP_K: int = int(os.getenv("OLLAMA_TOP_K", "20"))
+    # Number of tokens (or prediction length) for Ollama generation. Increase for longer outputs.
+    OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "4096"))
     # Minimum sources required before attempting answer
     MIN_RETRIEVED_RESULTS: int = int(os.getenv("MIN_RETRIEVED_RESULTS", "1"))
     REQUIRE_SOURCES: bool = os.getenv("REQUIRE_SOURCES", "true").lower() == "true"
     # Enable query expansion (topical synonyms). Set to false to disable.
     ENABLE_QUERY_EXPANSION: bool = os.getenv("ENABLE_QUERY_EXPANSION", "true").lower() == "true"
+    # Enable citation graph expansion on top of vector/BM25 retrieval.
+    ENABLE_CITATION_GRAPH: bool = os.getenv("ENABLE_CITATION_GRAPH", "true").lower() == "true"
+    CITATION_GRAPH_HOPS: int = int(os.getenv("CITATION_GRAPH_HOPS", "1"))
+    CITATION_GRAPH_MAX_NODES: int = int(os.getenv("CITATION_GRAPH_MAX_NODES", "12"))
     # When true, retrieval methods may return a debug trace along with results
     RETRIEVAL_DEBUG: bool = os.getenv("RETRIEVAL_DEBUG", "false").lower() == "true"
+    # Confidence gate thresholds: if average retrieved relevance falls below these values,
+    # the pipeline retries with broader query expansion before generating an answer.
+    RETRIEVAL_CONFIDENCE_THRESHOLD_DEFAULT: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_DEFAULT", "0.40"))
+    RETRIEVAL_CONFIDENCE_THRESHOLD_CASES: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_CASES", "0.40"))
+    RETRIEVAL_CONFIDENCE_THRESHOLD_STATUTES: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_STATUTES", "0.40"))
+    RETRIEVAL_CONFIDENCE_THRESHOLD_REGULATIONS: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_REGULATIONS", "0.40"))
+    RETRIEVAL_CONFIDENCE_THRESHOLD_SESSION: float = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD_SESSION", "0.40"))
+    RETRIEVAL_CONFIDENCE_REWRITE_ENABLED: bool = os.getenv("RETRIEVAL_CONFIDENCE_REWRITE_ENABLED", "true").lower() == "true"
+    # Minimum recommended length for LLM answers (words). Used to nudge output verbosity.
+    MIN_OUTPUT_WORDS: int = int(os.getenv("MIN_OUTPUT_WORDS", "200"))
+    # When case sources are present, attempt to mention at least this many distinct cases
+    MIN_CASES_TO_MENTION: int = int(os.getenv("MIN_CASES_TO_MENTION", "2"))
 
 def get_device():
     if torch.cuda.is_available():

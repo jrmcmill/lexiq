@@ -1,5 +1,6 @@
 import requests
 import json
+import re
 from src.agent.state import AgentState
 from src.observability.logger import get_logger
 from src.config import Config
@@ -30,7 +31,7 @@ def _call_ollama(prompt: str) -> str:
         "temperature": Config.OLLAMA_TEMPERATURE,
         "top_p": Config.OLLAMA_TOP_P,
         "top_k": Config.OLLAMA_TOP_K,
-        "num_predict": 2048,
+        "num_predict": getattr(Config, 'OLLAMA_NUM_PREDICT', 4096),
     }
     try:
         # Use longer timeout for local LLM inference (up to 5 minutes)
@@ -49,6 +50,115 @@ def _call_ollama(prompt: str) -> str:
         raise RuntimeError("Ollama is not running. Start it with: ollama serve")
 
 
+def _normalize_chunk_text(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    normalized = re.sub(r"\s*([\.,;:!?])\s*", r"\1", normalized)
+    return normalized
+
+
+def _chunk_source_id(result: dict) -> str:
+    if not isinstance(result, dict):
+        return ''
+    metadata = result.get('metadata') if isinstance(result.get('metadata'), dict) else {}
+    provenance = result.get('provenance') if isinstance(result.get('provenance'), dict) else {}
+    candidates = [
+        result.get('source_id'),
+        metadata.get('source_id'),
+        metadata.get('chunk_id'),
+        metadata.get('id'),
+        provenance.get('source_id'),
+        provenance.get('chunk_id'),
+        provenance.get('node_id'),
+        provenance.get('graph_node_id'),
+    ]
+    for candidate in candidates:
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return ''
+
+
+def _dedupe_retrieved_chunks(results: list[dict]) -> list[dict]:
+    if not results:
+        return []
+
+    seen = set()
+    deduped = []
+    removed = 0
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        source_id = _chunk_source_id(result)
+        text = _normalize_chunk_text(result.get('text', ''))
+        if not text:
+            continue
+        key = (source_id, text)
+        if key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        deduped.append(result)
+
+    if removed:
+        logger.info(f"Removed {removed} duplicate retrieved chunk(s) before prompt assembly")
+    return deduped
+
+
+INLINE_SOURCE_RE = re.compile(r"\[Source:\s*([^\]]+?)\s*\]")
+
+
+def _normalize_reference(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "")).lower().strip()
+
+
+def _allowed_source_references(used_sources: list[dict]) -> set[str]:
+    allowed = set()
+    for source in used_sources or []:
+        if not isinstance(source, dict):
+            continue
+        for field in ('citation', 'source_id'):
+            value = source.get(field)
+            if value:
+                allowed.add(_normalize_reference(str(value)))
+    return allowed
+
+
+def _sanitize_inline_source_references(text: str, allowed_refs: set[str]) -> tuple[str, list[str]]:
+    removed: list[str] = []
+
+    def replace(match: re.Match) -> str:
+        ref = match.group(1).strip()
+        if _normalize_reference(ref) in allowed_refs:
+            return f"[Source: {ref}]"
+        removed.append(ref)
+        return ""
+
+    sanitized = INLINE_SOURCE_RE.sub(replace, text or "")
+    # Remove any bracketed tokens that do not contain alphanumeric characters (e.g., '[.]', '[]')
+    def _clean_empty_brackets(m: re.Match) -> str:
+        inner = m.group(1) or ''
+        if not re.search(r"[A-Za-z0-9]", inner):
+            return ''
+        return m.group(0)
+
+    sanitized = re.sub(r"\[([^\]]*?)\]", _clean_empty_brackets, sanitized)
+    sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
+    return sanitized, removed
+
+
+def _filter_citations_against_sources(citations: list[str], allowed_refs: set[str]) -> tuple[list[str], list[str]]:
+    kept = []
+    removed = []
+    for citation in citations or []:
+        normalized = _normalize_reference(citation)
+        if normalized in allowed_refs:
+            kept.append(citation)
+        else:
+            removed.append(citation)
+    return kept, removed
+
+
 def route_query(state: AgentState) -> AgentState:
     prompt = (
         f"Given the legal query below, determine which knowledge sources are needed. "
@@ -57,6 +167,8 @@ def route_query(state: AgentState) -> AgentState:
         f"Query: {state['query']}"
     )
     try:
+        # keep a copy of the original prompt text in case downstream repairs overwrite
+        initial_llm_prompt = prompt
         resp = _call_ollama(prompt)
         # try parse JSON
         j = json.loads(resp)
@@ -78,19 +190,77 @@ def route_query(state: AgentState) -> AgentState:
 
 def retrieve_node(state: AgentState) -> AgentState:
     calls = state.get('tool_calls', [])
+    retrieval_warnings = state.get('retrieval_warnings', []) or []
+    retrieval_confidence = state.get('retrieval_confidence', {}) or {}
+
+    def confidence_threshold(source_label: str) -> float:
+        mapping = {
+            'case_law': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_CASES,
+            'statute': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_STATUTES,
+            'regulation': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_REGULATIONS,
+            'session': Config.RETRIEVAL_CONFIDENCE_THRESHOLD_SESSION,
+        }
+        return float(mapping.get(source_label, Config.RETRIEVAL_CONFIDENCE_THRESHOLD_DEFAULT))
+
+    def unpack_results(payload):
+        if isinstance(payload, dict):
+            return payload.get('results', []), payload.get('trace', {})
+        return payload or [], {}
+
+    def maybe_gate(label: str, query: str, fetch_fn, fetch_kwargs: dict):
+        nonlocal retrieval_warnings, retrieval_confidence
+        threshold = confidence_threshold(label)
+        initial_payload = fetch_fn(query, debug=True, aggressive=False, **fetch_kwargs)
+        initial_results, initial_trace = unpack_results(initial_payload)
+        initial_avg = float(initial_trace.get('average_score') or 0.0)
+        best_results = initial_results
+        best_trace = dict(initial_trace)
+        best_avg = initial_avg
+
+        if initial_avg < threshold and Config.RETRIEVAL_CONFIDENCE_REWRITE_ENABLED:
+            retry_payload = fetch_fn(query, debug=True, aggressive=True, **fetch_kwargs)
+            retry_results, retry_trace = unpack_results(retry_payload)
+            retry_avg = float(retry_trace.get('average_score') or 0.0)
+            if retry_results and (retry_avg > best_avg or retry_avg >= threshold):
+                best_results = retry_results
+                best_trace = dict(retry_trace)
+                best_avg = retry_avg
+            else:
+                best_trace['rewrite_attempted'] = True
+                best_trace['rewrite_average_score'] = retry_avg
+                best_trace['rewrite_result_count'] = len(retry_results)
+
+            if best_avg < threshold:
+                retrieval_warnings.append(
+                    f"Low-confidence retrieval for {label.replace('_', ' ')}: average relevance {best_avg:.2f} below threshold {threshold:.2f} after rewrite/expansion."
+                )
+
+        retrieval_confidence[label] = {
+            'average_score': best_avg,
+            'threshold': threshold,
+            'result_count': len(best_results),
+            'rewrite_attempted': best_avg < threshold or initial_avg < threshold,
+        }
+        return best_results
+
     try:
         if 'case_law' in calls:
-            state['retrieved_cases'] = tools.case_law_search(state['query'], state.get('court_filter'), state.get('date_after'), state.get('date_before'))
+            state['retrieved_cases'] = maybe_gate(
+                'case_law',
+                state['query'],
+                tools.case_law_search,
+                {'court_filter': state.get('court_filter'), 'date_after': state.get('date_after'), 'date_before': state.get('date_before')},
+            )
     except Exception as e:
         logger.error(str(e))
     try:
         if 'statute' in calls:
-            state['retrieved_statutes'] = tools.statute_search(state['query'])
+            state['retrieved_statutes'] = maybe_gate('statute', state['query'], tools.statute_search, {})
     except Exception as e:
         logger.error(str(e))
     try:
         if 'regulation' in calls:
-            state['retrieved_regs'] = tools.regulation_search(state['query'])
+            state['retrieved_regs'] = maybe_gate('regulation', state['query'], tools.regulation_search, {})
     except Exception as e:
         logger.error(str(e))
     try:
@@ -98,6 +268,9 @@ def retrieve_node(state: AgentState) -> AgentState:
             state['retrieved_session'] = tools.session_document_search(state['query'], state['session_id'])
     except Exception as e:
         logger.error(str(e))
+
+    state['retrieval_warnings'] = retrieval_warnings
+    state['retrieval_confidence'] = retrieval_confidence
     return state
 
 
@@ -137,6 +310,66 @@ def generate_answer(state: AgentState) -> AgentState:
         except Exception:
             pass
         return 0.0
+
+    def _parent_key_for(r: dict, label: str) -> str:
+        """Return a parent/document identifier for grouping duplicates.
+        Falls back to chunk/source id when no parent identifier is available.
+        """
+        if not isinstance(r, dict):
+            return ''
+        meta = r.get('metadata', {}) if isinstance(r.get('metadata'), dict) else {}
+        # Cases: prefer parent_opinion_id, bluebook_cite, case_name
+        if label == 'CASE':
+            return meta.get('parent_opinion_id') or meta.get('bluebook_cite') or meta.get('case_name') or _chunk_source_id(r) or ''
+        # Statutes: prefer usc_citation, title+section
+        if label == 'STATUTE':
+            return meta.get('usc_citation') or (str(meta.get('title') or '') + '|' + str(meta.get('section') or '')) or _chunk_source_id(r) or ''
+        # Regulations: prefer cfr_citation, title+section
+        if label == 'REGULATION':
+            return meta.get('cfr_citation') or (str(meta.get('title') or '') + '|' + str(meta.get('section') or '')) or _chunk_source_id(r) or ''
+        # Session or other docs: try a title or source id
+        return meta.get('title') or meta.get('heading') or _chunk_source_id(r) or ''
+
+    def _group_and_select_by_parent(results: list[dict], label: str) -> list[dict]:
+        """Group retrieved chunks by parent document identifier and keep the highest-scoring chunk per parent.
+
+        This reduces repetition when the same case/document is split into multiple chunks.
+        """
+        if not results or not isinstance(results, list):
+            return []
+
+        groups: dict[str, list[dict]] = {}
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            parent = _parent_key_for(r, label) or '__no_parent__'
+            groups.setdefault(parent, []).append(r)
+
+        selected: list[dict] = []
+        removed = 0
+        for parent, items in groups.items():
+            # pick the highest relevance_of(item)
+            best = None
+            best_score = float('-inf')
+            for it in items:
+                try:
+                    sc = relevance_of(it)
+                except Exception:
+                    sc = 0.0
+                if sc is None:
+                    sc = 0.0
+                if sc > best_score:
+                    best_score = sc
+                    best = it
+            if best is not None:
+                selected.append(best)
+            removed += max(0, len(items) - 1)
+
+        if removed:
+            logger.info(f"Grouped {len(results)} {label} chunks into {len(selected)} parent documents, removed {removed} sibling chunks")
+
+        # Also remove exact duplicate text blocks across selected items
+        return _dedupe_retrieved_chunks(selected)
 
     def collect_and_limit(label, results):
         """Return a trimmed, sorted list of results to include in prompt."""
@@ -179,10 +412,9 @@ def generate_answer(state: AgentState) -> AgentState:
             annotated.append((rel, r))
         # sort by relevance desc
         annotated.sort(key=lambda x: x[0], reverse=True)
-        # limit by per-tool budget (favor cases, constrain non-case context)
+        # limit by per-tool budget (favor cases, but do not artificially cap statutes/regulations lower)
         default_limit = getattr(Config, 'MAX_DOCS_PER_TOOL', 8)
-        non_case_limit = getattr(Config, 'MAX_NON_CASE_DOCS_PER_TOOL', 3)
-        limit = default_limit if label == 'CASE' else min(default_limit, non_case_limit)
+        limit = default_limit
 
         # Upweight canonical case entities: prefer one representative chunk per parent_opinion_id
         if label == 'CASE':
@@ -228,35 +460,123 @@ def generate_answer(state: AgentState) -> AgentState:
             logger.info(f"Trimming {len(annotated) - len(kept)} {label} results to top {limit} by relevance")
         return kept
 
-    cases_for_prompt = collect_and_limit('CASE', state.get('retrieved_cases', []))
-    stats_for_prompt = collect_and_limit('STATUTE', state.get('retrieved_statutes', []))
-    regs_for_prompt = collect_and_limit('REGULATION', state.get('retrieved_regs', []))
-    sess_for_prompt = collect_and_limit('SESSION', state.get('retrieved_session', []))
+    # Group and select one representative chunk per parent document (case, statute, regulation)
+    # This prevents the same underlying case/document from appearing multiple times
+    # when it was split into many chunks during ingestion.
+    raw_cases = _group_and_select_by_parent(state.get('retrieved_cases', []), 'CASE')
+    raw_stats = _group_and_select_by_parent(state.get('retrieved_statutes', []), 'STATUTE')
+    raw_regs = _group_and_select_by_parent(state.get('retrieved_regs', []), 'REGULATION')
+    raw_session = _group_and_select_by_parent(state.get('retrieved_session', []), 'SESSION')
+
+    # Intent classification: determine which source families are actually needed
+    # Use a single LLM call that returns a JSON array of families (e.g. ["case_law","statutes"]).
+    classifier_prompt = f"""You are a legal research assistant. Given a legal research query, determine which source types are necessary to answer it properly, based on how that type of legal question is typically resolved in U.S. law.
+
+Rules:
+- case_law: include if the question asks about legal standards, elements of a claim or crime, how courts have interpreted something, precedent, or outcomes in similar situations
+- statutes: include if the question asks about what the law requires, prohibits, or defines, or if the topic is an area typically governed by legislation
+- regulations: include if the question asks about compliance requirements, agency rules, permits, or industry-specific rules
+
+A query may need all three, or just one. Do not default to including all three — only include what is genuinely necessary.
+
+Return only a JSON array. Examples:
+- 'what are the required legal components of fraud?' > ["case_law", "statutes"]
+- 'give me examples of environmental regulations' > ["statutes", "regulations"]
+- 'how have courts ruled on eminent domain takings?' > ["case_law"]
+- 'what permits are required to discharge into a waterway?' > ["statutes", "regulations"]
+
+Query: {state.get('query')}
+Return only the JSON array, nothing else."""
+
+    intent_families = None
+    try:
+        clf_resp = _call_ollama(classifier_prompt)
+        parsed = json.loads(clf_resp)
+        if isinstance(parsed, list):
+            intent_families = [str(x).lower().strip() for x in parsed if x]
+    except Exception:
+        intent_families = None
+
+    # Fallback: if classifier fails, include all families so we don't omit relevant info
+    if not intent_families:
+        intent_families = ['case_law', 'statutes', 'regulations']
+
+    def _family_requested(name: str) -> bool:
+        """Normalize and check common family names/variants from classifier output."""
+        n = name.lower()
+        if n in ('case_law', 'case', 'cases'):
+            return any(x in intent_families for x in ('case_law', 'case', 'cases'))
+        if n in ('statute', 'statutes'):
+            return any(x in intent_families for x in ('statute', 'statutes'))
+        if n in ('regulation', 'regulations'):
+            return any(x in intent_families for x in ('regulation', 'regulations'))
+        return name.lower() in intent_families
+
+    include_cases = _family_requested('case_law')
+    include_statutes = _family_requested('statutes')
+    include_regulations = _family_requested('regulations')
+
+    # Filter out families not requested by the intent classifier before assembling the prompt
+    if not include_cases:
+        raw_cases = []
+    if not include_statutes:
+        raw_stats = []
+    if not include_regulations:
+        raw_regs = []
+
+    cases_for_prompt = collect_and_limit('CASE', raw_cases)
+    stats_for_prompt = collect_and_limit('STATUTE', raw_stats)
+    regs_for_prompt = collect_and_limit('REGULATION', raw_regs)
+    sess_for_prompt = collect_and_limit('SESSION', raw_session)
 
     def add_results(label, results):
         nonlocal total_results
         source_type = _normalize_source_type(label)
+        top_score = 0.0
+        try:
+            top_score = max((relevance_of(r) for r in results if isinstance(r, dict)), default=0.0)
+        except Exception:
+            top_score = 0.0
+        if top_score <= 0.0:
+            top_score = 1.0
+
+        def priority_for(relative_weight: float) -> str:
+            if relative_weight >= 0.85:
+                return "HIGH"
+            if relative_weight >= 0.6:
+                return "MEDIUM"
+            return "LOW"
+
         for r in results:
             try:
                 meta = r.get('metadata', {})
                 cite = meta.get('bluebook_cite') or meta.get('usc_citation') or meta.get('cfr_citation') or meta.get('case_name')
                 text = r.get('text', '')
                 score = r.get('score')
+                rel_score = relevance_of(r)
+                relative_weight = max(0.0, min(1.0, rel_score / top_score))
                 dedupe_key = (source_type, cite or text[:200])
                 if dedupe_key in seen_context:
                     continue
                 seen_context.add(dedupe_key)
                 score_str = f" [relevance: {score:.2f}]" if score is not None else ""
+                weight_str = f"RELATIVE_WEIGHT: {relative_weight:.2f} | PRIORITY: {priority_for(relative_weight)}\n"
                 court = meta.get('court') or meta.get('jurisdiction') or ''
                 date = meta.get('decision_date') or meta.get('date') or ''
                 court_line = f"COURT: {court}\n" if court else ""
                 date_line = f"DATE: {date}\n" if date else ""
-                block = f"SOURCE: {source_type}\nCITATION: {cite}\n{court_line}{date_line}TEXT: {text}{score_str}\n"
+                block = f"SOURCE: {source_type}\nCITATION: {cite}\n{weight_str}{court_line}{date_line}TEXT: {text}{score_str}\n"
                 if source_type == 'Case Law':
                     case_parts.append(block)
                 else:
                     other_parts.append(block)
-                used_sources.append({'type': source_type, 'citation': cite, 'score': score, 'distance': r.get('distance')})
+                used_sources.append({
+                    'type': source_type,
+                    'citation': cite,
+                    'source_id': r.get('source_id') or meta.get('source_id') or meta.get('chunk_id') or meta.get('id'),
+                    'score': score,
+                    'distance': r.get('distance'),
+                })
                 total_results += 1
             except Exception as e:
                 logger.error(f"Error processing result in {label}: {str(e)}")
@@ -281,57 +601,192 @@ def generate_answer(state: AgentState) -> AgentState:
     case_context = "\n\n".join(case_parts)
     other_context = "\n\n".join(other_parts)
 
-    # Create an explicit lead-case summary to make cases highly salient to the LLM
-    lead_case_block = ""
-    try:
-        if case_parts:
-            # case_parts are blocks starting with SOURCE/CITATION/TEXT
-            # use the first case's citation and a short excerpt as a summary
-            first_case = case_parts[0]
-            # extract CITATION line and TEXT snippet
-            lines = first_case.splitlines()
-            citation_line = next((l for l in lines if l.startswith('CITATION:')), '')
-            text_line = next((l for l in lines if l.startswith('TEXT:')), '')
-            cite = citation_line.replace('CITATION:', '').strip() if citation_line else ''
+    def _source_family_stats(items: list[dict]) -> dict:
+        stats: dict = {}
+        for item in items:
+            source_type = item.get('type', 'Source')
+            bucket = stats.setdefault(source_type, {'count': 0, 'score_sum': 0.0, 'citations': []})
+            bucket['count'] += 1
+            try:
+                bucket['score_sum'] += float(item.get('score') or 0.0)
+            except Exception:
+                pass
+            citation = item.get('citation')
+            if citation and citation not in bucket['citations']:
+                bucket['citations'].append(citation)
+        return stats
+
+    def _family_weight(bucket: dict) -> float:
+        score_sum = float(bucket.get('score_sum') or 0.0)
+        if score_sum > 0.0:
+            return score_sum
+        return float(bucket.get('count') or 0.0)
+
+    def _query_suggests_cases(query: str) -> bool:
+        text = (query or '').lower()
+        return any(token in text for token in [
+            'case', 'cases', 'court', 'v.', 'versus', 'supreme court', 'appeal', 'opinion', 'ruling',
+        ])
+
+    family_stats = _source_family_stats(used_sources)
+    ranked_families = sorted(
+        ((family, _family_weight(bucket), bucket) for family, bucket in family_stats.items()),
+        key=lambda item: (item[1], item[2].get('count', 0)),
+        reverse=True,
+    )
+    total_family_weight = sum(weight for _, weight, _ in ranked_families) or 1.0
+    primary_family = ranked_families[0][0] if ranked_families else 'Source'
+    case_bucket = family_stats.get('Case Law', {'count': 0, 'score_sum': 0.0, 'citations': []})
+    case_weight = _family_weight(case_bucket)
+    case_weight_share = case_weight / total_family_weight if total_family_weight else 0.0
+    primary_weight_share = (ranked_families[0][1] / total_family_weight) if ranked_families else 0.0
+    case_required = bool(case_bucket.get('count')) and (
+        primary_family == 'Case Law' or case_weight_share >= 0.30 or _query_suggests_cases(state.get('query', ''))
+    )
+
+    source_strategy_lines = [
+        "SOURCE STRATEGY:",
+        f"- Primary evidence family: {primary_family} ({primary_weight_share:.2f} of the available source weight)",
+        f"- Case Law required: {'yes' if case_required else 'no'}",
+        "- Treat the primary family as the backbone of the answer and use other families only when they materially change the rule or outcome.",
+        "- Do not force every family into every answer; omit a family if it is only tangential.",
+        "- Do not substitute statutes or regulations for case reasoning when the provided cases directly answer the question.",
+    ]
+    for family, _, bucket in ranked_families[:3]:
+        cites = ', '.join(bucket.get('citations', [])[:3])
+        if cites:
+            source_strategy_lines.append(f"- Top {family} citations: {cites}")
+    source_strategy = "\n".join(source_strategy_lines)
+
+    def _extract_text_excerpt(block: str, max_chars: int = 280) -> str:
+        try:
+            lines = block.splitlines()
+            text_line = next((line for line in lines if line.startswith('TEXT:')), '')
             text = text_line.replace('TEXT:', '').strip() if text_line else ''
-            excerpt = (text[:400] + '...') if len(text) > 400 else text
-            lead_case_block = f"LEAD CASE: {cite}\nSUMMARY: {excerpt}\n"
-    except Exception:
-        lead_case_block = ""
+            if len(text) > max_chars:
+                return text[:max_chars].rstrip() + '...'
+            return text
+        except Exception:
+            return ''
+
+    case_highlights = ""
+    if case_parts and case_required:
+        highlight_blocks = []
+        for block in case_parts[:6]:
+            try:
+                lines = block.splitlines()
+                citation_line = next((line for line in lines if line.startswith('CITATION:')), '')
+                weight_line = next((line for line in lines if line.startswith('RELATIVE_WEIGHT:')), '')
+                citation = citation_line.replace('CITATION:', '').strip() if citation_line else ''
+                weight = weight_line.replace('RELATIVE_WEIGHT:', '').strip() if weight_line else ''
+                excerpt = _extract_text_excerpt(block)
+                highlight_blocks.append(
+                    f"- {citation}\n  {weight}\n  SUMMARY: {excerpt}"
+                )
+            except Exception:
+                continue
+        if highlight_blocks:
+            case_highlights = "CASE HIGHLIGHTS (read these first):\n" + "\n\n".join(highlight_blocks)
 
     formatted_context = "\n\n".join([
-        lead_case_block,
-        f"CASE SOURCES (prioritize these if present):\n{case_context}" if case_context else "",
+        source_strategy,
+        case_highlights,
+        f"CASE SOURCES:\n{case_context}" if case_context else "",
         f"OTHER SOURCES:\n{other_context}" if other_context else "",
     ]).strip()
-    
-    # Improved system prompt with stronger grounding
-    prompt = f"""You are LexIQ, an expert legal research assistant. Your responses must be grounded in the provided sources.
 
-CRITICAL RULES:
-1. ONLY answer using the provided sources below
-2. If sources don't adequately answer the question, clearly state: "Based on the available sources, I cannot provide a complete answer to this question."
-3. Do NOT make inferences beyond what the sources explicitly state
-4. Do NOT use general legal knowledge not found in sources
-5. ALWAYS cite every claim with proper Bluebook format
-6. If a source has a relevance score shown, consider lower scores (<0.3) as weak evidence
-7. Explicitly state any limitations in the available sources
-8. If any CASE SOURCES are present, lead your answer with them and explain how they answer the question before mentioning other authorities
-8b. If CASE SOURCES are present, begin your substantive answer with a `CASE ANALYSIS:` section that cites the lead case(s) and includes a 1-2 sentence summary drawn explicitly from the TEXT provided above
-9. If the question is about a recent court case, do not substitute a different older case when a newer case source is present
-10. If a source directly discusses the question's key term, use that source rather than substituting a generic legal explanation
+    retrieval_warning_text = "\n".join(state.get('retrieval_warnings', []) or [])
+    
+    # Compute a dynamic minimum-word target based on provided context size
+    try:
+        num_context_docs = max(1, len(case_parts) + len(other_parts))
+        total_context_chars = sum(len(b) for b in (case_parts + other_parts)) if (case_parts or other_parts) else 0
+        # Roughly estimate words ~= chars/6. Ensure at least the configured baseline, and cap to avoid excessive demands.
+        estimated_words_from_context = int(total_context_chars / 6)
+        doc_based_words = num_context_docs * 30
+        dynamic_min_words = max(
+            getattr(Config, 'MIN_OUTPUT_WORDS', 200),
+            min(4096, max(estimated_words_from_context, doc_based_words)),
+        )
+    except Exception:
+        dynamic_min_words = getattr(Config, 'MIN_OUTPUT_WORDS', 200)
+
+    # Aggressive grounding rules: require explicit grounding in the provided SOURCES
+    must_lines = [
+        "MUST: Base your entire answer on the sources shown in the SOURCES block. Do not invent facts, citations, or authorities not present in those sources.",
+        "MUST: When a retrieved source is relevant, incorporate it into the answer rather than skipping it, but avoid repeating the same point in multiple sections.",
+        "MUST: After any factual sentence that relies on a source, include an inline reference in the exact form [Source: <exact citation or source ID from the source block>].",
+        "MUST: Do not use abbreviated or altered citation text; use the citation or source ID exactly as it appears in the SOURCES block.",
+        "MUST: If the provided sources are insufficient to fully answer the question, explicitly state what is missing and which specific sources would be needed.",
+    ]
+
+    # Conditionally require case discussion when classifier asked for case law
+    if include_cases:
+        must_lines.append(f"MUST: Because case law is relevant, explicitly discuss at least {Config.MIN_CASES_TO_MENTION} distinct cases from the CASE SOURCES (or all available cases if fewer) and summarize each using text from its TEXT block.")
+
+    # Conditionally include statutory/regulatory interaction guidance only if statutes or regulations were requested
+    if include_statutes or include_regulations:
+        must_lines.append("MUST: When statutes or regulations are relevant, include a STATUTORY/REGULATORY INTERACTION section that connects the authorities to the issue.")
+
+    # System prompt with grounding but softer tone
+    # Conditionally include section guidance based on the intent classifier results
+    instruction_lines = [
+        "- Provide a clear, conversational answer based on the sources above. If you must interpret, mark those sentences as interpretation.",
+        f"- Try to produce an answer of at least {dynamic_min_words} words (approx.) when the sources provide enough material; if not, explain the limitation and expand on direct text from sources.",
+        "- Use section headings only when they genuinely help the answer; avoid repeating the same heading or forcing a template structure.",
+        "- If a section has little or no relevant content, omit it rather than adding filler.",
+        "- When multiple distinct retrieved sources are relevant, cover each one concisely instead of centering the answer on a single example.",
+        "- Use the strongest relevant sources first, but include other relevant sources when they materially add detail or show a common legal component.",
+        "- Where possible, add inline references in the form `[Source: <exact citation or source ID from the source block>]` after claims that rely on a source.",
+        "- Use only source IDs/citations present in the SOURCES block above; do not invent new references.",
+        "- Be factual and neutral; do not provide legal advice.",
+    ]
+
+    # Conditionally require case discussion when classifier asked for case law
+    if include_cases:
+        instruction_lines.insert(2, f"- When Case Law is actually needed for the query, discuss at least {Config.MIN_CASES_TO_MENTION} distinct cases by name (or all cases if fewer are available), summarizing key points from their provided TEXT blocks.")
+
+    # Conditionally include statutory/regulatory interaction guidance only if statutes or regulations were requested
+    if include_statutes or include_regulations:
+        # suggest an interaction section only when the query truly needs it
+        instruction_lines.insert(3, "- When statutes or regulations are genuinely relevant, include a `STATUTORY/REGULATORY_INTERACTION:` section that links authorities to the issues raised.")
+
+    source_coverage_lines = [
+        "SOURCE COVERAGE:",
+        "- Prefer to mention each distinct retrieved source that is genuinely relevant at least once.",
+        "- If multiple cases, statutes, or regulations answer the question, compare them instead of repeating the same source or point.",
+        "- Keep each source discussion concise and avoid restating the same legal component in separate sections.",
+    ]
+    for family, _, bucket in ranked_families[:5]:
+        cites = ', '.join(bucket.get('citations', [])[:5])
+        if cites:
+            source_coverage_lines.append(f"- {family}: {cites}")
+    source_coverage = "\n".join(source_coverage_lines)
+
+    prompt = f"""You are LexIQ, an expert legal research assistant. Aim to ground your response in the provided sources.
+
+Guidance:
+- Prefer using only the provided sources below when answering the question.
+- If the sources do not fully answer the question, say so and explain which information is missing or uncertain.
+- Avoid making broad inferences beyond what the sources clearly show; where you do infer, label it as interpretation.
+- Where relevant, cite sources in Bluebook format or inline references to the citations shown in the SOURCES block.
+- Treat higher relevance scores as stronger evidence and note when evidence appears weak or sparse.
+- State any important limitations of the available sources.
+- If CASE SOURCES are present, discuss the most relevant cases first but avoid overemphasizing a single case unless it plainly controls the outcome.
+- When multiple CASE SOURCES are available and clearly relevant, compare their key similarities or differences.
+- Use the SOURCE STRATEGY block as the main guidance for which families to prioritize, but do not feel bound to force every family into every answer.
 
 SOURCES (with relevance scores where available):
 {formatted_context}
 
+{source_coverage}
+
 QUESTION: {state['query']}
 
+{f'RETRIEVAL WARNINGS:\n{retrieval_warning_text}\n' if retrieval_warning_text else ''}
+
 Instructions:
-- Provide a thorough, well-organized answer using ONLY the sources above
-- Start with the most directly relevant case source if present and explain how it answers the question
-- If sources are insufficient, clearly state the limitation
-- Include a "Citations" section at the end with Bluebook-formatted citations
-- Be precise and objective; do not provide legal advice
+{"\n".join(must_lines + instruction_lines)}
 """
     
     try:
@@ -342,9 +797,8 @@ Instructions:
         state['used_sources'] = used_sources
         return state
 
-    # If CASE SOURCES exist but the draft omits them, denies their presence,
-    # or introduces out-of-source citations, run constrained conversational
-    # rewrite attempts (non-deterministic).
+    # If CASE SOURCES exist but the draft omits them or introduces out-of-source
+    # citations, run constrained conversational rewrite attempts (non-deterministic).
     try:
         case_cites = [s.get('citation') for s in used_sources if s.get('type') == 'Case Law' and s.get('citation')]
         allowed_citations = [s.get('citation') for s in used_sources if s.get('citation')]
@@ -355,7 +809,6 @@ Instructions:
             if nm:
                 case_names.append(nm)
         case_markers = [m for m in (case_cites + case_names) if m]
-        primary_case_cite = case_cites[0] if case_cites else (case_names[0] if case_names else "")
 
         def contains_negative_case_claim(text: str) -> bool:
             low = (text or '').lower()
@@ -387,10 +840,9 @@ Instructions:
 
         repair_attempts = max(1, getattr(Config, 'MAX_CASE_REPAIR_ATTEMPTS', 2))
         need_repair = (
-            bool(case_markers)
+            case_required
             and (
-                contains_negative_case_claim(resp)
-                or not mentions_any_marker(resp, case_markers)
+                not mentions_any_marker(resp, case_markers)
                 or has_disallowed_citation(resp)
             )
         )
@@ -398,42 +850,88 @@ Instructions:
         for _ in range(repair_attempts):
             if not need_repair:
                 break
+            # Force a stricter repair that must explicitly mention case citations when case law is the primary evidence family.
+            to_mention = []
+            try:
+                markers = case_cites or case_names
+                required_mentions = max(1, min(len(markers), getattr(Config, 'MIN_CASES_TO_MENTION', 2)))
+                for m in markers[:required_mentions]:
+                    if m:
+                        to_mention.append(m)
+            except Exception:
+                to_mention = case_cites or case_names
 
-            repair_prompt = f"""You wrote a draft answer that did not properly use available case sources.
+            must_mention_list = '\n'.join([f"- {m}" for m in to_mention]) if to_mention else ''
+            # Use the dynamically computed target for repair as well
+            min_words = dynamic_min_words
+
+            repair_prompt = f"""You wrote a draft answer that failed to explicitly discuss required case sources from the provided context. Revise the draft to include and *explicitly discuss* the following case citations (use their names exactly as shown) and include a 2-3 sentence summary for each:
+
+{must_mention_list}
 
 QUESTION:
 {state['query']}
 
-MANDATORY CASE SOURCES (must be used and discussed first):
+MANDATORY CONTEXT (use ONLY these sources and material already shown in the CASE HIGHLIGHTS and CASE SOURCES blocks):
 {case_context}
-
-OTHER SOURCES (optional, use only if directly relevant):
-{other_context}
 
 DRAFT ANSWER TO REVISE:
 {resp}
 
-Rewrite the answer so it is conversational and summary-like.
-Rules:
-- Start with the most relevant case source and explain it in plain language.
-- The first paragraph must explicitly mention this case citation: {primary_case_cite}
-- Explicitly connect that case to the Voting Rights Act only using the provided sources.
-- Do not claim that no recent case exists if a case source is provided.
-- Do not cite or discuss authorities that are not in the provided sources.
-- Keep the response concise and readable.
-- End with a short citations list using only provided citations.
-"""
+Rewrite rules (MUST follow):
+- For each required citation above, include the citation text (exact match) and a 2-3 sentence summary drawn from its provided TEXT block.
+- Add inline source references in the form `[Source: <exact citation or source ID from the source block>]` immediately after each factual sentence.
+- Do not invent source references; only use items present in the provided context.
+- After the case summaries, write a `STATUTORY/REGULATORY INTERACTION:` section that connects the cases to relevant statutes or regulations in the prompt where applicable.
+- End with a `SYNTHESIS/CONCLUSION:` section summarizing common elements and practical implications.
+- The revised answer must be at least {min_words} words long unless fewer words are unavoidable because the provided sources are truly tiny; if so, explicitly state the limitation in the conclusion.
+- Do NOT introduce citations or authorities that are not in the provided sources.
+
+If Case Law is not required, do not force case discussion into the rewrite; focus on the primary family from the SOURCE STRATEGY block instead.
+
+Return only the revised answer (no commentary)."""
+
             resp = _call_ollama(repair_prompt)
             need_repair = (
-                contains_negative_case_claim(resp)
-                or not mentions_any_marker(resp, case_markers)
+                not mentions_any_marker(resp, to_mention)
                 or has_disallowed_citation(resp)
             )
     except Exception as e:
         logger.error(f"Error in case-repair pass: {e}")
 
+    if retrieval_warning_text:
+        resp = f"⚠️ RETRIEVAL WARNING: {retrieval_warning_text}\n\n{resp}"
+
+    # Post-generation source validation: remove any inline source refs or citations
+    # that do not correspond to a retrieved source ID/citation.
+    try:
+        allowed_refs = _allowed_source_references(used_sources)
+        resp, removed_inline = _sanitize_inline_source_references(resp, allowed_refs)
+        extracted_citations = extract_citations_from_text(resp)
+        filtered_citations, removed_citations = _filter_citations_against_sources(extracted_citations, allowed_refs)
+
+        for removed_citation in removed_citations:
+            resp = resp.replace(removed_citation, '')
+        resp = re.sub(r"[ \t]{2,}", " ", resp)
+        resp = re.sub(r"\n{3,}", "\n\n", resp).strip()
+
+        if removed_inline or removed_citations:
+            logger.warning(
+                "Removed unsupported citation(s) from generated answer: "
+                f"inline={removed_inline}, citations={removed_citations}"
+            )
+            state['citation_validation_warning'] = {
+                'removed_inline_sources': removed_inline,
+                'removed_citations': removed_citations,
+            }
+
+        state['citations'] = filtered_citations
+    except Exception as e:
+        logger.error(f"Error validating citations against retrieved sources: {e}")
+
     state['final_answer'] = resp
-    state['citations'] = extract_citations_from_text(resp)
+    if 'citations' not in state:
+        state['citations'] = extract_citations_from_text(resp)
     state['used_sources'] = used_sources
     return state
 

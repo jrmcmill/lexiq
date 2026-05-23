@@ -15,3 +15,5 @@ class AgentState(TypedDict):
     date_after: str | None
     date_before: str | None
     error: str | None
+    retrieval_warnings: List[str]
+    retrieval_confidence: Dict[str, Any]
